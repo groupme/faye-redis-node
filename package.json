@@ -15,7 +15,6 @@
     "main": "./faye-redis",
     "dependencies": {
         "redis": "",
-        "hiredis": "",
         "consistent-hashing": "",
         "node-statsd": ""
     },
