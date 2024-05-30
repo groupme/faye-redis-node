@@ -2,10 +2,9 @@
 .gitignore
 .gitmodules
 .npmignore
-.redcar
 .travis.yml
 dump.rdb
-Rakefile
+Makefile
 node_modules
 spec
 vendor

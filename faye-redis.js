@@ -222,7 +222,7 @@ Engine.prototype = {
 
     this._redis.zscore(this._ns + '/clients', clientId, function(error, score) {
       if (timeout) {
-        callback.call(context, score > new Date().getTime() - 1000 * 1.75 * timeout);
+        callback.call(context, parseInt(score, 10) > new Date().getTime() - 1000 * 1.75 * timeout);
       } else {
         callback.call(context, score !== null);
       }
@@ -346,9 +346,10 @@ Engine.prototype = {
           self.clientExists(clientId, function(exists) {
             if (exists) {
               self._server.debug('Queueing for client ?: ?', clientId, message);
-              self._redis.rpush(self._ns + '/clients/' + clientId + '/messages', jsonMessage);
+              var queue = self._ns + '/clients/' + clientId + '/messages';
+              self._redis.rpush(queue, jsonMessage);
               self._redis.publish(self._ns + '/notifications', clientId);
-              self._redis.expire(self._ns + '/clients/' + clientId + '/messages', 3600)
+              self._redis.expire(queue, 3600)
 
               notified.push(clientId);
             } else {
@@ -376,6 +377,7 @@ Engine.prototype = {
         self  = this;
 
     multi.lrange(key, 0, -1, function(error, jsonMessages) {
+      if (!jsonMessages) return;
       var messages = jsonMessages.map(function(json) { return JSON.parse(json) });
       self._server.deliver(clientId, messages);
     });
