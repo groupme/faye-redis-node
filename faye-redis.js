@@ -1,44 +1,189 @@
+// Constructor for multiRedis. It sets up two connections for each provided
+// Redis URL and adds them to a ketema ring. One connection is used for
+// commands and the other is used for pub/sub subscriptions.
+var multiRedis = function(urls) {
+  var hasher = require('hashring'),
+      self   = this;
+
+  self.ring          = new hasher(urls);
+  self.urls          = urls;
+  self.connections   = {};
+  self.subscriptions = {};
+
+  urls.forEach(function(url) {
+    var options = self.parse(url);
+
+    var connection   = self.connect(options);
+    var subscription = self.connect(options);
+
+    self.connections[url]   = connection;
+    self.subscriptions[url] = subscription;
+  });
+};
+
+// [ command, argument-to-shard-against ]
+multiRedis.COMMANDS = [
+  ['smembers', 0],
+  ['del', 0],
+  ['sadd', 0],
+  ['srem', 0],
+  ['rpush', 0],
+  ['expire', 0],
+  ['get', 0],
+  ['getset', 0],
+  ['zrem', 1],
+  ['zadd', 2],
+  ['zscore', 1]
+];
+
+multiRedis.prototype = {
+  // Grab the connection from the ring for the pub/sub server for the message
+  // and delegate a publish call to it.
+  publish: function(topic, message) {
+    var connection = this.connectionFor(message);
+
+    connection.publish.apply(connection, arguments);
+  },
+
+  // Subscribe to the topic on all of the subscription connections and call
+  // the callback on a new message.
+  subscribe: function(topic, callback) {
+    var self = this;
+
+    self.urls.forEach(function(url) {
+      var subscription = self.subscriptions[url];
+
+      subscription.subscribe(topic);
+      subscription.on('message', callback);
+    });
+  },
+
+  // Returns a connection based on a single key for dispatching multiple
+  // connections atomically. You should only commit operations against a single
+  // key during a multi due to the sharding.
+  multi: function(key) {
+    return this.connectionFor(key).multi();
+  },
+
+  // Returns a new Redis connection. Expects a server configuration object,
+  // e.g.:
+  //
+  //   { port: 6379,
+  //   hostname: 'localhost',
+  //   database: 0,
+  //   password: 'chunkybacon' }
+  connect: function(server) {
+    var redis      = require('redis'),
+        connection = redis.createClient(server.port, server.hostname);
+
+    connection.select(server.database);
+
+    if (server.password)
+      connection.auth(server.password);
+
+    return connection;
+  },
+
+  // Parses a URL and returns a server configuration object, e.g.:
+  //
+  // redis://:chunkybacon@localhost:6379/0
+  parse: function(url) {
+    var url        = require('url').parse(url),
+        connection = { hostname: url.hostname, port: url.port };
+
+    if (url.auth)
+      connection.password = url.auth.split(":")[1];
+
+    if (url.path) {
+      connection.database = url.path.substring(1);
+    } else {
+      connection.database = 0;
+    }
+
+    return connection;
+  },
+
+  // Closes all connections to Redis.
+  end: function() {
+    var self = this;
+
+    self.urls.forEach(function(url) {
+      self.connections[url].end();
+
+      self.subscriptions[url].unsubscribe();
+      self.subscriptions[url].end();
+    });
+  },
+
+  // Returns a connection for a given key.
+  connectionFor: function(key) {
+    return this.connections[this.ring.get(key)];
+  }
+};
+
+// Loops through the commands and adds each one to multiRedis.
+multiRedis.COMMANDS.forEach(function(command) {
+  var redisCommand = command[0],
+      argument = command[1];
+
+  multiRedis.prototype[redisCommand] = function() {
+    var connection = this.connectionFor(arguments[argument]);
+    return connection[redisCommand].apply(connection, arguments);
+  }
+});
+
+// A mock, no-op statsd client.
+var NoStatsD = {
+  increment: function() {},
+  gauge:     function() {}
+};
+
+// Creates a new Faye Redis engine.
+//
+// Custom options:
+//   disable_subscriptions If set to `true`, then this engine will not subscribe
+//                         to the notifications channel.
+//
+//   gc                    When `true`, GC is run continuously in this process.
+//                         Seeing as how it's no longer interval-based, you
+//                         probably only want to set this in a dedicated GC
+//                         process.
+//
+//   onRedisError          If provided, then this will be called for Redis
+//                         errors, and will be passed the error returned from
+//                         the Redis driver and a message. If unset, then we'll
+//                         simply log these errors.
+//
+//   statsd                Pass a statsd object that implements increment() and
+//                         gauge() in order get GC & client statistics. Stats
+//                         published with the "faye_redis." namespace.
+//
 var Engine = function(server, options) {
-  this._server  = server;
   this._options = options || {};
 
-  var redis  = require('redis'),
-      host   = this._options.host     || this.DEFAULT_HOST,
-      port   = this._options.port     || this.DEFAULT_PORT,
-      db     = this._options.database || this.DEFAULT_DATABASE,
-      auth   = this._options.password,
-      gc     = this._options.gc       || this.DEFAULT_GC,
-      socket = this._options.socket;
-
-  this._ns  = this._options.namespace || '';
-
-  if (socket) {
-    this._redis = redis.createClient(socket, {no_ready_check: true});
-    this._subscriber = redis.createClient(socket, {no_ready_check: true});
-  } else {
-    this._redis = redis.createClient(port, host, {no_ready_check: true});
-    this._subscriber = redis.createClient(port, host, {no_ready_check: true});
-  }
-
-  if (auth) {
-    this._redis.auth(auth);
-    this._subscriber.auth(auth);
-  }
-  this._redis.select(db);
-  this._subscriber.select(db);
-
-  this._messageChannel = this._ns + '/notifications/messages';
-  this._closeChannel   = this._ns + '/notifications/close';
-
   var self = this;
-  this._subscriber.subscribe(this._messageChannel);
-  this._subscriber.subscribe(this._closeChannel);
-  this._subscriber.on('message', function(topic, message) {
-    if (topic === self._messageChannel) self.emptyQueue(message);
-    if (topic === self._closeChannel)   self._server.trigger('close', message);
-  });
 
-  this._gc = setInterval(function() { self.gc() }, gc * 1000);
+  this._server     = server;
+  this._ns         = this._options.namespace || '';
+  this._redis      = new multiRedis(options.servers);
+  this._onRedisError = this._options.onRedisError;
+  this._statsd = this._options.statsd || NoStatsD;
+
+  if (!this._onRedisError) {
+    this._onRedisError = function(error, message) {
+      this._server.error.apply(this._server, [error, message]);
+    }
+  }
+
+  if (!this._options.disable_subscriptions) {
+    this._redis.subscribe(this._ns + '/notifications', function(topic, message) {
+      self.emptyQueue(message);
+    });
+  }
+
+  if (this._options.gc) {
+    this.gc();
+  }
 };
 
 Engine.create = function(server, options) {
@@ -46,66 +191,109 @@ Engine.create = function(server, options) {
 };
 
 Engine.prototype = {
-  DEFAULT_HOST:     'localhost',
-  DEFAULT_PORT:     6379,
-  DEFAULT_DATABASE: 0,
   DEFAULT_GC:       60,
   LOCK_TIMEOUT:     120,
 
   disconnect: function() {
     this._redis.end();
-    this._subscriber.unsubscribe();
-    this._subscriber.end();
     clearInterval(this._gc);
   },
 
   createClient: function(callback, context) {
-    var clientId = this._server.generateId(), self = this;
-    this._redis.zadd(this._ns + '/clients', 0, clientId, function(error, added) {
+    var clientId = this._server.generateId(),
+        score = new Date().getTime(),
+        self = this;
+
+    this._redis.zadd(this._ns + '/clients', score, clientId, function(error, added) {
       if (added === 0) return self.createClient(callback, context);
-      self._server.debug('Created new client ?', clientId);
-      self.ping(clientId);
+      self._server.debug('Created new client ? with score ?', clientId, score);
       self._server.trigger('handshake', clientId);
       callback.call(context, clientId);
     });
   },
 
   clientExists: function(clientId, callback, context) {
-    var cutoff = new Date().getTime() - (1000 * 1.6 * this._server.timeout);
+    var timeout = this._server.timeout;
+
+    if (clientId === undefined) {
+      this._server.debug("[RedisEngine#clientExists] undefined clientId, returning false");
+      return callback.call(context, false);
+    }
 
     this._redis.zscore(this._ns + '/clients', clientId, function(error, score) {
-      callback.call(context, parseInt(score, 10) > cutoff);
+      if (timeout) {
+        callback.call(context, parseInt(score, 10) > new Date().getTime() - 1000 * 1.75 * timeout);
+      } else {
+        callback.call(context, score !== null);
+      }
     });
   },
 
+  // Destroy a client.
+  //
+  // The first part of cleaning up a client is removing subscriptions, which
+  // removes the client ID from all the channels that it's a member of. This
+  // prevents messages from being published to that client.
+  //
+  // In a reversal of earlier behavior, callbacks are now _always_ called,
+  // but with an argument that indicates whether or not the destroy actually
+  // succeeded.
   destroyClient: function(clientId, callback, context) {
     var self = this;
+    var clientChannelsKey = this._ns + "/clients/" + clientId + "/channels";
 
-    this._redis.smembers(this._ns + '/clients/' + clientId + '/channels', function(error, channels) {
-      var multi = self._redis.multi();
+    this._redis.smembers(clientChannelsKey, function(error, channels) {
+      if (error) {
+        self._onRedisError(error, "Failed to fetch channels "+clientChannelsKey);
+        return self._failGC(callback, context);
+      }
 
-      multi.zadd(self._ns + '/clients', 0, clientId);
+      var numChannels = channels.length, numUnsubscribes = 0;
+
+      if (numChannels == 0) {
+        return self._deleteClient(clientId, callback, context);
+      }
 
       channels.forEach(function(channel) {
-        multi.srem(self._ns + '/clients/' + clientId + '/channels', channel);
-        multi.srem(self._ns + '/channels' + channel, clientId);
-      });
-      multi.del(self._ns + '/clients/' + clientId + '/messages');
-      multi.zrem(self._ns + '/clients', clientId);
-      multi.publish(self._closeChannel, clientId);
-
-      multi.exec(function(error, results) {
-        channels.forEach(function(channel, i) {
-          if (results[2 * i + 1] !== 1) return;
-          self._server.trigger('unsubscribe', clientId, channel);
-          self._server.debug('Unsubscribed client ? from channel ?', clientId, channel);
+        var channelsKey = self._ns + "/channels" + channel;
+        self._redis.srem(channelsKey, clientId, function(error, res) {
+          if (error) {
+            self._onRedisError(error, "Failed to remove client "+clientId+" from "+channelsKey);
+            return self._failGC(callback, context);
+          }
+          numUnsubscribes += 1;
+          self._server.trigger("unsubscribe", clientId, channel);
+          if (numUnsubscribes == numChannels) {
+            self._deleteClient(clientId, callback, context);
+          }
         });
-
-        self._server.debug('Destroyed client ?', clientId);
-        self._server.trigger('disconnect', clientId);
-
-        if (callback) callback.call(context);
       });
+    });
+  },
+
+  // Removes the client bookkeeping records.
+  //
+  // Finishes client cleanup by removing the mailbox, channel set, and finally
+  // the client ID from the sorted set. Once again, any Redis errors shut down
+  // the callback chain, and we'll rely on GC to pick it back up again.
+  _deleteClient: function(clientId, callback, context) {
+    var self = this,
+        clientChannelsKey = this._ns + "/clients/" + clientId + "/channels",
+        clientMessagesKey = this._ns + "/clients/" + clientId + "/messages";
+
+    this._redis.del(clientChannelsKey);
+    this._redis.del(clientMessagesKey);
+    this._redis.zrem(self._ns + "/clients", clientId, function(error, res) {
+      if (error) {
+        self._onRedisError(error, "Failed to remove from /clients, client ID "+clientId);
+        return self._failGC(callback, context);
+      }
+      self._server.debug("Destroyed client ? successfully", clientId);
+      self._server.trigger("disconnect", clientId);
+      self._statsd.increment("faye_redis.gc_success");
+      if (callback) {
+        callback.call(context, true);
+      }
     });
   },
 
@@ -145,24 +333,38 @@ Engine.prototype = {
     this._server.debug('Publishing message ?', message);
 
     var self        = this,
+        notified    = [],
         jsonMessage = JSON.stringify(message),
         keys        = channels.map(function(c) { return self._ns + '/channels' + c });
 
     var notify = function(error, clients) {
+      if (error) {
+        return self._server.error("Failed to fetch clients, candidate channels ?: ?", keys, error);
+      }
       clients.forEach(function(clientId) {
-        var queue = self._ns + '/clients/' + clientId + '/messages';
+        if (notified.indexOf(clientId) == -1) {
+          self.clientExists(clientId, function(exists) {
+            if (exists) {
+              self._server.debug('Queueing for client ?: ?', clientId, message);
+              var queue = self._ns + '/clients/' + clientId + '/messages';
+              self._redis.rpush(queue, jsonMessage);
+              self._redis.publish(self._ns + '/notifications', clientId);
+              self._redis.expire(queue, 3600)
 
-        self._server.debug('Queueing for client ?: ?', clientId, message);
-        self._redis.rpush(queue, jsonMessage);
-        self._redis.publish(self._messageChannel, clientId);
-
-        self.clientExists(clientId, function(exists) {
-          if (!exists) self._redis.del(queue);
-        });
+              notified.push(clientId);
+            } else {
+              self._server.debug("Destroying expired client ? from publish", clientId);
+              self.destroyClient(clientId);
+            }
+          });
+        }
       });
     };
-    keys.push(notify);
-    this._redis.sunion.apply(this._redis, keys);
+
+    keys.forEach(function(key) {
+      if (key.indexOf("*") == -1)
+        self._redis.smembers(key, notify);
+    });
 
     this._server.trigger('publish', message.clientId, message.channel, message.data);
   },
@@ -171,7 +373,7 @@ Engine.prototype = {
     if (!this._server.hasConnection(clientId)) return;
 
     var key   = this._ns + '/clients/' + clientId + '/messages',
-        multi = this._redis.multi(),
+        multi = this._redis.multi(key),
         self  = this;
 
     multi.lrange(key, 0, -1, function(error, jsonMessages) {
@@ -187,49 +389,67 @@ Engine.prototype = {
     var timeout = this._server.timeout;
     if (typeof timeout !== 'number') return;
 
-    this._withLock('gc', function(releaseLock) {
-      var cutoff = new Date().getTime() - 1000 * 2 * timeout,
-          self   = this;
+    var self = this;
 
-      this._redis.zrangebyscore(this._ns + '/clients', 0, cutoff, function(error, clients) {
-        var i = 0, n = clients.length;
-        if (i === n) return releaseLock();
+    this._redis.urls.forEach(function(url) {
+      this._server.debug("Starting GC loop for ?", url);
+      process.nextTick(function() {
+        this._runGC(url, timeout);
+      }.bind(this));
 
-        clients.forEach(function(clientId) {
-          this.destroyClient(clientId, function() {
-            i += 1;
-            if (i === n) releaseLock();
-          }, this);
-        }, self);
-      });
+      // Track the number of clients in each shard with a statsd gauge.
+      var host = require("url").parse(url).hostname.replace(/\./g, '_'),
+          conn = this._redis.connections[url],
+          self = this,
+          key = "faye_redis.clients",
+          tag = "backend:" + host;
+
+      setInterval(function() {
+        conn.zcard(self._ns + "/clients", function(error, n) {
+          if (!error) {
+            self._statsd.gauge(key, n, 1, [tag]);
+          }
+        });
+      }, 10000);
     }, this);
   },
 
-  _withLock: function(lockName, callback, context) {
-    var lockKey     = this._ns + '/locks/' + lockName,
-        currentTime = new Date().getTime(),
-        expiry      = currentTime + this.LOCK_TIMEOUT * 1000 + 1,
-        self        = this;
+  _runGC: function(url, timeout) {
+    var conn = this._redis.connections[url],
+        cutoff = new Date().getTime() - 1000 * 2 * timeout,
+        self = this;
 
-    var releaseLock = function() {
-      if (new Date().getTime() < expiry) self._redis.del(lockKey);
-    };
+    conn.zrangebyscore(this._ns + "/clients", 0, cutoff, "LIMIT", 0, 1, function(error, clients) {
+      if (error) {
+        self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
+        return setTimeout(self._runGC.bind(self), 2000, url, timeout);
+      }
 
-    this._redis.setnx(lockKey, expiry, function(error, set) {
-      if (set === 1) return callback.call(context, releaseLock);
+      if (clients.length == 0) {
+        self._server.debug("[?] No GC clients, retrying in 2 seconds...", url);
+        return setTimeout(self._runGC.bind(self), 2000, url, timeout);
+      }
 
-      self._redis.get(lockKey, function(error, timeout) {
-        if (!timeout) return;
-
-        var lockTimeout = parseInt(timeout, 10);
-        if (currentTime < lockTimeout) return;
-
-        self._redis.getset(lockKey, expiry, function(error, oldValue) {
-          if (oldValue !== timeout) return;
-          callback.call(context, releaseLock);
-        });
+      var clientId = clients[0];
+      self.destroyClient(clientId, function(success) {
+        if (success) {
+          self._server.debug("[?] GC succeeded for ?", url, clientId);
+        } else {
+          self._server.warn("[?] GC failed for ?", url, clientId);
+        }
+        process.nextTick(function() {
+          self._runGC(url, timeout);
+        }.bind(self));
       });
     });
+  },
+
+  // A helper function to log a GC error and invoke the callback (if it exists).
+  _failGC: function(callback, context) {
+    this._statsd.increment("faye_redis.gc_failure");
+    if (callback) {
+      callback.call(context, false);
+    }
   }
 };
 
