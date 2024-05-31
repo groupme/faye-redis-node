@@ -420,29 +420,29 @@ Engine.prototype = {
         cutoff = new Date().getTime() - 1000 * 2 * timeout,
         self = this;
 
-    conn.zrange(redisKey, 0, cutoff, "BYSCORE", function(error, clients) {
-      if (error) {
-        self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
-        return setTimeout(self._runGC.bind(self), 2000, url, timeout);
-      }
+    // conn.zrange(redisKey, 0, cutoff, "BYSCORE", function(error, clients) {
+    //   if (error) {
+    //     self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
+    //     return setTimeout(self._runGC.bind(self), 2000, url, timeout);
+    //   }
 
-      if (clients.length == 0) {
-        self._server.debug("[?] No GC clients, retrying in 2 seconds...", url);
-        return setTimeout(self._runGC.bind(self), 2000, url, timeout);
-      }
+    //   if (clients.length == 0) {
+    //     self._server.debug("[?] No GC clients, retrying in 2 seconds...", url);
+    //     return setTimeout(self._runGC.bind(self), 2000, url, timeout);
+    //   }
 
-      var clientId = clients[0];
-      self.destroyClient(clientId, function(success) {
-        if (success) {
-          self._server.debug("[?] GC succeeded for ?", url, clientId);
-        } else {
-          self._server.warn("[?] GC failed for ?", url, clientId);
-        }
-        process.nextTick(function() {
-          self._runGC(url, timeout);
-        }.bind(self));
-      });
-    });
+    //   var clientId = clients[0];
+    //   self.destroyClient(clientId, function(success) {
+    //     if (success) {
+    //       self._server.debug("[?] GC succeeded for ?", url, clientId);
+    //     } else {
+    //       self._server.warn("[?] GC failed for ?", url, clientId);
+    //     }
+    //     process.nextTick(function() {
+    //       self._runGC(url, timeout);
+    //     }.bind(self));
+    //   });
+    // });
   },
 
   // A helper function to log a GC error and invoke the callback (if it exists).
