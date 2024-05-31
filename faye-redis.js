@@ -416,10 +416,11 @@ Engine.prototype = {
 
   _runGC: function(url, timeout) {
     var conn = this._redis.connections[url],
+        redisKey = this._ns + "/clients",
         cutoff = new Date().getTime() - 1000 * 2 * timeout,
         self = this;
 
-    conn.zrange(this._ns + "/clients", 0, cutoff, "BYSCORE", "LIMIT", 0, 1, function(error, clients) {
+    conn.zrange(redisKey, 0, cutoff, "BYSCORE", function(error, clients) {
       if (error) {
         self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
         return setTimeout(self._runGC.bind(self), 2000, url, timeout);
