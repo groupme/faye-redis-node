@@ -136,13 +136,17 @@ multiRedis.prototype = {
       var url = self.urls[i];
 
       try {
-        await self.connections[url].quit();
+        if (self.connections[url]) {
+          await self.connections[url].quit();
+        }
       } catch (e) {
         // Connection may already be closed
       }
 
       try {
-        await self.subscriptions[url].quit();
+        if (self.subscriptions[url]) {
+          await self.subscriptions[url].quit();
+        }
       } catch (e) {
         // Connection may already be closed
       }
@@ -221,14 +225,20 @@ var Engine = function(server, options) {
   this._redis      = new multiRedis(options.servers);
   this._initialized = false;
   this._initPromise = null;
+  this._gcIntervals = [];
+
+  // Auto-initialize on construction (for Faye compatibility)
+  // This starts the async connection process immediately
+  this._ensureInitialized();
 };
 
 Engine.create = function(server, options) {
   return new this(server, options);
 };
 
-// Initialize the engine (connect to Redis)
-Engine.prototype.init = async function() {
+// Ensures the engine is initialized, starting initialization if needed.
+// Returns a promise that resolves when initialization is complete.
+Engine.prototype._ensureInitialized = function() {
   var self = this;
 
   if (this._initPromise) {
@@ -236,30 +246,41 @@ Engine.prototype.init = async function() {
   }
 
   this._initPromise = (async function() {
-    await self._redis.init();
+    try {
+      await self._redis.init();
 
-    if (!self._options.disable_subscriptions) {
-      await self._redis.subscribe(self._ns + '/notifications', function(topic, message) {
-        self.emptyQueue(message);
-      });
-    }
-
-    if (self._options.gc) {
-      if (process.env.STATSD_URL) {
-        var statsd = require("node-statsd").StatsD;
-
-        var statsdUrl = new URL(process.env.STATSD_URL);
-        var prefix = "push." + process.env.NODE_ENV + ".";
-        self.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
+      if (!self._options.disable_subscriptions) {
+        await self._redis.subscribe(self._ns + '/notifications', function(topic, message) {
+          self.emptyQueue(message);
+        });
       }
 
-      self.gc();
-    }
+      if (self._options.gc) {
+        if (process.env.STATSD_URL) {
+          var statsd = require("node-statsd").StatsD;
 
-    self._initialized = true;
+          var statsdUrl = new URL(process.env.STATSD_URL);
+          var prefix = "push." + process.env.NODE_ENV + ".";
+          self.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
+        }
+
+        self.gc();
+      }
+
+      self._initialized = true;
+      self._server.debug('Redis engine initialized successfully');
+    } catch (error) {
+      self._server.error('Failed to initialize Redis engine: ?', error);
+      throw error;
+    }
   })();
 
   return this._initPromise;
+};
+
+// Public init method for explicit initialization (also used by tests)
+Engine.prototype.init = function() {
+  return this._ensureInitialized();
 };
 
 Engine.prototype.DEFAULT_GC = 60;
@@ -283,6 +304,8 @@ Engine.prototype.disconnect = async function() {
  * @returns {Promise<string>} The new client ID.
  */
 Engine.prototype.createClient = async function(callback, context) {
+  await this._ensureInitialized();
+
   var clientId = this._server.generateId(),
       score = new Date().getTime(),
       self = this;
@@ -311,6 +334,8 @@ Engine.prototype.createClient = async function(callback, context) {
  * @returns {Promise<boolean>} Whether the client exists.
  */
 Engine.prototype.clientExists = async function(clientId, callback, context) {
+  await this._ensureInitialized();
+
   var timeout = this._server.timeout;
 
   if (clientId === undefined) {
@@ -346,6 +371,8 @@ Engine.prototype.clientExists = async function(clientId, callback, context) {
 // but with an argument that indicates whether or not the destroy actually
 // succeeded.
 Engine.prototype.destroyClient = async function(clientId, callback, context) {
+  await this._ensureInitialized();
+
   var self = this;
   var clientChannelsKey = this._ns + "/clients/" + clientId + "/channels";
 
@@ -401,6 +428,8 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
 };
 
 Engine.prototype.ping = async function(clientId) {
+  await this._ensureInitialized();
+
   var timeout = this._server.timeout;
   if (typeof timeout !== 'number') return;
 
@@ -411,6 +440,8 @@ Engine.prototype.ping = async function(clientId) {
 };
 
 Engine.prototype.subscribe = async function(clientId, channel, callback, context) {
+  await this._ensureInitialized();
+
   var self = this;
 
   try {
@@ -429,6 +460,8 @@ Engine.prototype.subscribe = async function(clientId, channel, callback, context
 };
 
 Engine.prototype.unsubscribe = async function(clientId, channel, callback, context) {
+  await this._ensureInitialized();
+
   var self = this;
 
   try {
@@ -447,6 +480,8 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
 };
 
 Engine.prototype.publish = async function(message, channels) {
+  await this._ensureInitialized();
+
   this._server.debug('Publishing message ?', message);
 
   var self        = this,
@@ -491,6 +526,8 @@ Engine.prototype.publish = async function(message, channels) {
 };
 
 Engine.prototype.emptyQueue = async function(clientId) {
+  await this._ensureInitialized();
+
   if (!this._server.hasConnection(clientId)) return;
 
   var key = this._ns + '/clients/' + clientId + '/messages',
@@ -514,32 +551,31 @@ Engine.prototype.gc = function() {
   var timeout = this._server.timeout;
   if (typeof timeout !== 'number') return;
 
-  this._gcIntervals = this._gcIntervals || [];
+  var self = this;
 
   this._redis.urls.forEach(function(url) {
-    this._server.debug("Starting GC loop for ?", url);
+    self._server.debug("Starting GC loop for ?", url);
     process.nextTick(function() {
-      this._runGC(url, timeout);
-    }.bind(this));
+      self._runGC(url, timeout);
+    });
 
     // Track the number of clients in each shard with a statsd gauge.
-    if (this.statsd) {
+    if (self.statsd) {
       var host = new URL(url).hostname.replace(/\./g, '_'),
-          conn = this._redis.connections[url],
-          gcSelf = this,
+          conn = self._redis.connections[url],
           statKey = "clients." + host;
 
       var intervalId = setInterval(async function() {
         try {
-          var n = await conn.zCard(gcSelf._ns + "/clients");
-          gcSelf.statsd.gauge(statKey, n);
+          var n = await conn.zCard(self._ns + "/clients");
+          self.statsd.gauge(statKey, n);
         } catch (error) {
           // Ignore errors
         }
       }, 10000);
-      this._gcIntervals.push(intervalId);
+      self._gcIntervals.push(intervalId);
     }
-  }, this);
+  });
 };
 
 Engine.prototype._runGC = async function(url, timeout) {

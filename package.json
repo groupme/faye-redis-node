@@ -19,6 +19,8 @@
   },
   "scripts": {
     "test": "node spec/simple_test.js",
+    "test:integration": "node spec/faye_integration_test.js",
+    "test:all": "node spec/simple_test.js && node spec/faye_integration_test.js",
     "test:legacy": "node spec/runner.js"
   },
   "bugs": "http://github.com/faye/faye-redis-node/issues",
