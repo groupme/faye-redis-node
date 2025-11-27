@@ -63,9 +63,9 @@ multiRedis.prototype = {
     }
   },
 
-  // Returns a connection based on a single key for dispatching multiple
-  // commands atomically. You should only commit operations against a single
-  // key during a multi due to the sharding.
+  // Returns a multi/transaction object for the connection that handles the given key.
+  // Use this when you need to execute multiple commands atomically on the same shard.
+  // Note: In redis v4+, multi() takes no arguments; the key is only used to select the connection.
   multi: function(key) {
     return this.connectionFor(key).multi();
   },
@@ -190,7 +190,8 @@ multiRedis.prototype = {
   },
 
   // zAdd signature in v4+: zAdd(key, { score, value }) or zAdd(key, [{ score, value }])
-  // For NX behavior (only add if not exists), use: zAdd(key, { score, value }, { NX: true })
+  // This implementation always overwrites existing members (does not use NX by default).
+  // To enable NX behavior (only add if not exists), use: zAdd(key, { score, value }, { NX: true })
   zAdd: function(key, score, member) {
     return this.connectionFor(key).zAdd(key, { score: score, value: member });
   },
@@ -313,7 +314,7 @@ Engine.prototype.createClient = async function(callback, context) {
   try {
     var added = await this._redis.zAdd(this._ns + '/clients', score, clientId);
     if (added === 0) {
-      return self.createClient(callback, context);
+      return await self.createClient(callback, context);
     }
     self._server.debug('Created new client ? with score ?', clientId, score);
     self._server.trigger('handshake', clientId);
@@ -534,7 +535,8 @@ Engine.prototype.emptyQueue = async function(clientId) {
       self = this;
 
   try {
-    var multi = this._redis.multi(key);
+    var conn = this._redis.connectionFor(key);
+    var multi = conn.multi();
     multi.lRange(key, 0, -1);
     multi.del(key);
 

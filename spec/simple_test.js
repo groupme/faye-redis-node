@@ -6,7 +6,6 @@
  */
 
 const RedisEngine = require('../faye-redis');
-const assert = require('assert');
 
 // Test results tracking
 let passed = 0;
@@ -22,7 +21,7 @@ function createMockServer(options = {}) {
   return {
     timeout: options.timeout || 60,
     generateId: function() {
-      return 'test-client-' + Math.random().toString(36).substr(2, 9);
+      return 'test-client-' + Math.random().toString(36).slice(2, 11);
     },
     debug: function() {
       if (options.verbose) console.log('[DEBUG]', ...arguments);
