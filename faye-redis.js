@@ -77,8 +77,9 @@ multiRedis.prototype = {
   //   hostname: 'localhost',
   //   database: 0,
   //   password: 'chunkybacon' }
-  connect: async function(server) {
+  connect: async function(server, errorLabel) {
     var redis = require('redis');
+    var label = errorLabel || 'Redis Client';
 
     var clientOptions = {
       socket: {
@@ -95,7 +96,7 @@ multiRedis.prototype = {
     var client = redis.createClient(clientOptions);
 
     client.on('error', function(err) {
-      console.error('Redis Client Error:', err);
+      console.error(label + ' Error:', err);
     });
 
     await client.connect();
@@ -103,29 +104,8 @@ multiRedis.prototype = {
   },
 
   // Creates a subscriber connection (separate from command connection in redis v4+)
-  connectSubscriber: async function(server) {
-    var redis = require('redis');
-
-    var clientOptions = {
-      socket: {
-        host: server.hostname,
-        port: server.port
-      },
-      database: parseInt(server.database, 10) || 0
-    };
-
-    if (server.password) {
-      clientOptions.password = server.password;
-    }
-
-    var client = redis.createClient(clientOptions);
-
-    client.on('error', function(err) {
-      console.error('Redis Subscriber Error:', err);
-    });
-
-    await client.connect();
-    return client;
+  connectSubscriber: function(server) {
+    return this.connect(server, 'Redis Subscriber');
   },
 
   // Parses a URL and returns a server configuration object, e.g.:
@@ -208,15 +188,15 @@ multiRedis.prototype = {
   // zAdd signature in v4+: zAdd(key, { score, value }) or zAdd(key, [{ score, value }])
   // For NX behavior (only add if not exists), use: zAdd(key, { score, value }, { NX: true })
   zAdd: function(key, score, member) {
-    return this.connectionFor(member).zAdd(key, { score: score, value: member });
+    return this.connectionFor(key).zAdd(key, { score: score, value: member });
   },
 
   zRem: function(key, member) {
-    return this.connectionFor(member).zRem(key, member);
+    return this.connectionFor(key).zRem(key, member);
   },
 
   zScore: function(key, member) {
-    return this.connectionFor(member).zScore(key, member);
+    return this.connectionFor(key).zScore(key, member);
   }
 };
 
@@ -287,9 +267,21 @@ Engine.prototype.LOCK_TIMEOUT = 120;
 
 Engine.prototype.disconnect = async function() {
   await this._redis.end();
-  clearInterval(this._gc);
+  if (this._gcIntervals) {
+    this._gcIntervals.forEach(function(intervalId) {
+      clearInterval(intervalId);
+    });
+    this._gcIntervals = [];
+  }
 };
 
+/**
+ * Creates a new client and registers it with the server.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ *                                Called with (clientId) on success.
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<string>} The new client ID.
+ */
 Engine.prototype.createClient = async function(callback, context) {
   var clientId = this._server.generateId(),
       score = new Date().getTime(),
@@ -303,11 +295,21 @@ Engine.prototype.createClient = async function(callback, context) {
     self._server.debug('Created new client ? with score ?', clientId, score);
     self._server.trigger('handshake', clientId);
     if (callback) callback.call(context, clientId);
+    return clientId;
   } catch (error) {
     self._server.error('Failed to create client: ?', error);
+    throw error;
   }
 };
 
+/**
+ * Checks if a client exists and is not expired.
+ * @param {string} clientId - The client ID to check.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ *                                Called with (exists: boolean).
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<boolean>} Whether the client exists.
+ */
 Engine.prototype.clientExists = async function(clientId, callback, context) {
   var timeout = this._server.timeout;
 
@@ -467,7 +469,7 @@ Engine.prototype.publish = async function(message, channels) {
           notified.push(clientId);
         } else {
           self._server.debug("Destroying expired client ? from publish", clientId);
-          self.destroyClient(clientId);
+          await self.destroyClient(clientId);
         }
       }
     }
@@ -512,7 +514,7 @@ Engine.prototype.gc = function() {
   var timeout = this._server.timeout;
   if (typeof timeout !== 'number') return;
 
-  var self = this;
+  this._gcIntervals = this._gcIntervals || [];
 
   this._redis.urls.forEach(function(url) {
     this._server.debug("Starting GC loop for ?", url);
@@ -527,7 +529,7 @@ Engine.prototype.gc = function() {
           gcSelf = this,
           statKey = "clients." + host;
 
-      setInterval(async function() {
+      var intervalId = setInterval(async function() {
         try {
           var n = await conn.zCard(gcSelf._ns + "/clients");
           gcSelf.statsd.gauge(statKey, n);
@@ -535,6 +537,7 @@ Engine.prototype.gc = function() {
           // Ignore errors
         }
       }, 10000);
+      this._gcIntervals.push(intervalId);
     }
   }, this);
 };
@@ -553,15 +556,16 @@ Engine.prototype._runGC = async function(url, timeout) {
     }
 
     var clientId = clients[0];
-    await self.destroyClient(clientId, function(success) {
-      if (success) {
-        self._server.debug("[?] GC succeeded for ?", url, clientId);
-      } else {
-        self._server.warn("[?] GC failed for ?", url, clientId);
-      }
-      process.nextTick(function() {
-        self._runGC(url, timeout);
-      });
+    var success = await self.destroyClient(clientId);
+
+    if (success) {
+      self._server.debug("[?] GC succeeded for ?", url, clientId);
+    } else {
+      self._server.warn("[?] GC failed for ?", url, clientId);
+    }
+
+    process.nextTick(function() {
+      self._runGC(url, timeout);
     });
   } catch (error) {
     self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
