@@ -50,9 +50,16 @@ multiRedis.prototype = {
 
   // Subscribe to the topic on all of the subscription connections and call
   // the callback on a new message.
+  //
   // Note: When multiple Redis servers are configured, this subscribes to all of them.
   // Messages are sharded by key, so each message only exists on one server.
   // This ensures we receive notifications regardless of which shard published them.
+  //
+  // IMPORTANT: This method should only be called once per topic. Calling it multiple
+  // times will register multiple handlers and cause duplicate message processing.
+  //
+  // The callback signature is (channel, message) to match the original Faye API.
+  // Redis v4+ provides (message, channel), so we swap the arguments.
   subscribe: async function(topic, callback) {
     var self = this;
 
@@ -60,6 +67,7 @@ multiRedis.prototype = {
       var url = self.urls[i];
       var subscription = self.subscriptions[url];
 
+      // Redis v4+ callback is (message, channel), but Faye expects (channel, message)
       await subscription.subscribe(topic, function(message, channel) {
         callback(channel, message);
       });
@@ -114,9 +122,17 @@ multiRedis.prototype = {
   // Parses a URL and returns a server configuration object, e.g.:
   //
   // redis://:chunkybacon@localhost:6379/0
+  //
+  // Throws an error if the URL is malformed.
   parse: function(redisUrl) {
-    var parsedUrl = new URL(redisUrl),
-        connection = { hostname: parsedUrl.hostname, port: parseInt(parsedUrl.port, 10) || 6379 };
+    var parsedUrl;
+    try {
+      parsedUrl = new URL(redisUrl);
+    } catch (e) {
+      throw new Error('Invalid Redis URL: ' + redisUrl + ' - ' + e.message);
+    }
+
+    var connection = { hostname: parsedUrl.hostname, port: parseInt(parsedUrl.port, 10) || 6379 };
 
     if (parsedUrl.password) {
       connection.password = parsedUrl.password;
@@ -261,11 +277,15 @@ Engine.prototype._ensureInitialized = function() {
 
       if (self._options.gc) {
         if (process.env.STATSD_URL) {
-          var statsd = require("node-statsd").StatsD;
+          try {
+            var statsd = require("node-statsd").StatsD;
 
-          var statsdUrl = new URL(process.env.STATSD_URL);
-          var prefix = "push." + process.env.NODE_ENV + ".";
-          self.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
+            var statsdUrl = new URL(process.env.STATSD_URL);
+            var prefix = "push." + process.env.NODE_ENV + ".";
+            self.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
+          } catch (e) {
+            self._server.error('Invalid STATSD_URL, disabling StatsD: ' + e.message);
+          }
         }
 
         self.gc();
@@ -310,23 +330,32 @@ Engine.prototype.disconnect = async function() {
 Engine.prototype.createClient = async function(callback, context) {
   await this._ensureInitialized();
 
-  var clientId = this._server.generateId(),
-      score = new Date().getTime(),
-      self = this;
+  var self = this;
+  var maxRetries = 10;
 
-  try {
-    var added = await this._redis.zAdd(this._ns + '/clients', score, clientId);
-    if (added === 0) {
-      return await self.createClient(callback, context);
+  for (var attempt = 0; attempt < maxRetries; attempt++) {
+    var clientId = this._server.generateId();
+    var score = new Date().getTime();
+
+    try {
+      var added = await this._redis.zAdd(this._ns + '/clients', score, clientId);
+      if (added === 1) {
+        self._server.debug('Created new client ? with score ?', clientId, score);
+        self._server.trigger('handshake', clientId);
+        if (callback) callback.call(context, clientId);
+        return clientId;
+      }
+      // added === 0 means clientId already exists (collision), try again
+      self._server.debug('Client ID collision, retrying... attempt ?', attempt + 1);
+    } catch (error) {
+      self._server.error('Failed to create client: ?', error);
+      throw error;
     }
-    self._server.debug('Created new client ? with score ?', clientId, score);
-    self._server.trigger('handshake', clientId);
-    if (callback) callback.call(context, clientId);
-    return clientId;
-  } catch (error) {
-    self._server.error('Failed to create client: ?', error);
-    throw error;
   }
+
+  var error = new Error('Failed to create unique client ID after ' + maxRetries + ' attempts');
+  self._server.error('Failed to create client: ?', error);
+  throw error;
 };
 
 /**
@@ -582,19 +611,23 @@ Engine.prototype.gc = function() {
 
     // Track the number of clients in each shard with a statsd gauge.
     if (self.statsd) {
-      var host = new URL(url).hostname.replace(/\./g, '_'),
-          conn = self._redis.connections[url],
-          statKey = "clients." + host;
+      try {
+        var host = new URL(url).hostname.replace(/\./g, '_'),
+            conn = self._redis.connections[url],
+            statKey = "clients." + host;
 
-      var intervalId = setInterval(async function() {
-        try {
-          var n = await conn.zCard(self._ns + "/clients");
-          self.statsd.gauge(statKey, n);
-        } catch (error) {
-          // Ignore errors
-        }
-      }, 10000);
-      self._gcIntervals.push(intervalId);
+        var intervalId = setInterval(async function() {
+          try {
+            var n = await conn.zCard(self._ns + "/clients");
+            self.statsd.gauge(statKey, n);
+          } catch (error) {
+            // Ignore errors
+          }
+        }, 10000);
+        self._gcIntervals.push(intervalId);
+      } catch (e) {
+        self._server.error('Failed to parse URL for stats: ' + e.message);
+      }
     }
   });
 };
