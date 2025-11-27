@@ -50,6 +50,9 @@ multiRedis.prototype = {
 
   // Subscribe to the topic on all of the subscription connections and call
   // the callback on a new message.
+  // Note: When multiple Redis servers are configured, this subscribes to all of them.
+  // Messages are sharded by key, so each message only exists on one server.
+  // This ensures we receive notifications regardless of which shard published them.
   subscribe: async function(topic, callback) {
     var self = this;
 
@@ -113,7 +116,7 @@ multiRedis.prototype = {
   // redis://:chunkybacon@localhost:6379/0
   parse: function(redisUrl) {
     var parsedUrl = new URL(redisUrl),
-        connection = { hostname: parsedUrl.hostname, port: parsedUrl.port || 6379 };
+        connection = { hostname: parsedUrl.hostname, port: parseInt(parsedUrl.port, 10) || 6379 };
 
     if (parsedUrl.password) {
       connection.password = parsedUrl.password;
@@ -408,9 +411,12 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
       clientMessagesKey = this._ns + "/clients/" + clientId + "/messages";
 
   try {
-    await this._redis.del(clientChannelsKey);
-    await this._redis.del(clientMessagesKey);
-    await this._redis.zRem(self._ns + "/clients", clientId);
+    // Execute independent Redis delete operations in parallel for better performance
+    await Promise.all([
+      this._redis.del(clientChannelsKey),
+      this._redis.del(clientMessagesKey),
+      this._redis.zRem(self._ns + "/clients", clientId)
+    ]);
 
     self._server.debug("Destroyed client ? successfully", clientId);
     self._server.trigger("disconnect", clientId);
@@ -436,8 +442,13 @@ Engine.prototype.ping = async function(clientId) {
 
   var time = new Date().getTime();
 
-  this._server.debug('Ping ?, ?', clientId, time);
-  await this._redis.zAdd(this._ns + '/clients', time, clientId);
+  try {
+    this._server.debug('Ping ?, ?', clientId, time);
+    await this._redis.zAdd(this._ns + '/clients', time, clientId);
+  } catch (error) {
+    this._server.error('Failed to ping client ?: ?', clientId, error);
+    throw error;
+  }
 };
 
 Engine.prototype.subscribe = async function(clientId, channel, callback, context) {
@@ -457,6 +468,8 @@ Engine.prototype.subscribe = async function(clientId, channel, callback, context
     if (callback) callback.call(context);
   } catch (error) {
     self._server.error('Failed to subscribe client: ?', error);
+    if (callback) callback.call(context);
+    throw error;
   }
 };
 
@@ -477,6 +490,8 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
     if (callback) callback.call(context);
   } catch (error) {
     self._server.error('Failed to unsubscribe client: ?', error);
+    if (callback) callback.call(context);
+    throw error;
   }
 };
 
@@ -499,9 +514,13 @@ Engine.prototype.publish = async function(message, channels) {
 
         if (exists) {
           self._server.debug('Queueing for client ?: ?', clientId, message);
-          await self._redis.rPush(self._ns + '/clients/' + clientId + '/messages', jsonMessage);
-          await self._redis.publish(self._ns + '/notifications', clientId);
-          await self._redis.expire(self._ns + '/clients/' + clientId + '/messages', 3600);
+          var messagesKey = self._ns + '/clients/' + clientId + '/messages';
+          // Execute independent Redis operations in parallel for better performance
+          await Promise.all([
+            self._redis.rPush(messagesKey, jsonMessage),
+            self._redis.publish(self._ns + '/notifications', clientId),
+            self._redis.expire(messagesKey, 3600)
+          ]);
           notified.push(clientId);
         } else {
           self._server.debug("Destroying expired client ? from publish", clientId);

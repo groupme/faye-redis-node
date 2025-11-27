@@ -51,7 +51,6 @@ FayeProxySimulator.prototype = {
 
   // Simulates Faye's connect method which calls ping and emptyQueue immediately
   connect: function(clientId, callback) {
-    var self = this;
     console.log('[FayeProxy] connect() called for', clientId);
 
     // This is what Faye does - calls ping and emptyQueue right away
