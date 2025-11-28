@@ -209,7 +209,12 @@ multiRedis.prototype = {
   },
 
   // zAdd signature in v4+: zAdd(key, { score, value }) or zAdd(key, [{ score, value }])
-  // This implementation always overwrites existing members (does not use NX by default).
+  //
+  // Return value: Returns the number of NEW elements added to the sorted set.
+  // If the member already exists, its score is updated but the return value is 0.
+  // This is important for collision detection in createClient().
+  //
+  // This implementation always overwrites existing scores (does not use NX by default).
   // To enable NX behavior (only add if not exists), use: zAdd(key, { score, value }, { NX: true })
   zAdd: function(key, score, member) {
     return this.connectionFor(key).zAdd(key, { score: score, value: member });
@@ -497,7 +502,7 @@ Engine.prototype.subscribe = async function(clientId, channel, callback, context
     if (callback) callback.call(context);
   } catch (error) {
     self._server.error('Failed to subscribe client: ?', error);
-    if (callback) callback.call(context);
+    // Don't call callback on error - let the thrown error propagate to Promise-based callers
     throw error;
   }
 };
@@ -519,7 +524,7 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
     if (callback) callback.call(context);
   } catch (error) {
     self._server.error('Failed to unsubscribe client: ?', error);
-    if (callback) callback.call(context);
+    // Don't call callback on error - let the thrown error propagate to Promise-based callers
     throw error;
   }
 };
@@ -530,32 +535,30 @@ Engine.prototype.publish = async function(message, channels) {
   this._server.debug('Publishing message ?', message);
 
   var self        = this,
-      notified    = [],
+      notified    = new Set(),
       jsonMessage = JSON.stringify(message),
       keys        = channels.map(function(c) { return self._ns + '/channels' + c; });
 
-  var notify = async function(clients) {
-    for (var i = 0; i < clients.length; i++) {
-      var clientId = clients[i];
+  var notifyClient = async function(clientId) {
+    if (notified.has(clientId)) {
+      return;
+    }
+    notified.add(clientId);
 
-      if (notified.indexOf(clientId) === -1) {
-        var exists = await self.clientExists(clientId);
+    var exists = await self.clientExists(clientId);
 
-        if (exists) {
-          self._server.debug('Queueing for client ?: ?', clientId, message);
-          var messagesKey = self._ns + '/clients/' + clientId + '/messages';
-          // Execute independent Redis operations in parallel for better performance
-          await Promise.all([
-            self._redis.rPush(messagesKey, jsonMessage),
-            self._redis.publish(self._ns + '/notifications', clientId),
-            self._redis.expire(messagesKey, 3600)
-          ]);
-          notified.push(clientId);
-        } else {
-          self._server.debug("Destroying expired client ? from publish", clientId);
-          await self.destroyClient(clientId);
-        }
-      }
+    if (exists) {
+      self._server.debug('Queueing for client ?: ?', clientId, message);
+      var messagesKey = self._ns + '/clients/' + clientId + '/messages';
+      // Execute independent Redis operations in parallel for better performance
+      await Promise.all([
+        self._redis.rPush(messagesKey, jsonMessage),
+        self._redis.publish(self._ns + '/notifications', clientId),
+        self._redis.expire(messagesKey, 3600)
+      ]);
+    } else {
+      self._server.debug("Destroying expired client ? from publish", clientId);
+      await self.destroyClient(clientId);
     }
   };
 
@@ -564,7 +567,8 @@ Engine.prototype.publish = async function(message, channels) {
     if (key.indexOf("*") === -1) {
       try {
         var clients = await self._redis.sMembers(key);
-        await notify(clients);
+        // Process clients in parallel for better performance
+        await Promise.all(clients.map(notifyClient));
       } catch (error) {
         self._server.error("Failed to fetch clients, candidate channels ?: ?", keys, error);
       }

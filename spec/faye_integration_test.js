@@ -50,13 +50,20 @@ FayeProxySimulator.prototype = {
   },
 
   // Simulates Faye's connect method which calls ping and emptyQueue immediately
+  // Note: In real Faye, these are fire-and-forget calls. For testing, we add
+  // error handlers to catch any issues, but we don't await them to match Faye's behavior.
   connect: function(clientId, callback) {
+    var self = this;
     console.log('[FayeProxy] connect() called for', clientId);
 
-    // This is what Faye does - calls ping and emptyQueue right away
-    this._engine.ping(clientId);
+    // This is what Faye does - calls ping and emptyQueue right away (fire-and-forget)
+    this._engine.ping(clientId).catch(function(e) {
+      console.error('[FayeProxy] Ping failed:', e.message);
+    });
     this._connections[clientId] = true;
-    this._engine.emptyQueue(clientId);
+    this._engine.emptyQueue(clientId).catch(function(e) {
+      console.error('[FayeProxy] EmptyQueue failed:', e.message);
+    });
 
     // Simulate async callback
     setTimeout(function() {
