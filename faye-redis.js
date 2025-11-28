@@ -331,11 +331,15 @@ Engine.prototype.disconnect = async function() {
  *                                Called with (clientId) on success.
  * @param {Object} [context] - DEPRECATED: The context for the callback.
  * @returns {Promise<string>} The new client ID.
+ * @throws {Error} If a unique client ID cannot be generated after 10 attempts.
  */
 Engine.prototype.createClient = async function(callback, context) {
   await this._ensureInitialized();
 
   var self = this;
+  // Maximum retry attempts for client ID collision.
+  // With random 9-character IDs, collisions are extremely rare.
+  // 10 retries provides ample safety margin.
   var maxRetries = 10;
 
   for (var attempt = 0; attempt < maxRetries; attempt++) {
@@ -399,15 +403,15 @@ Engine.prototype.clientExists = async function(clientId, callback, context) {
   }
 };
 
-// Destroy a client.
-//
-// The first part of cleaning up a client is removing subscriptions, which
-// removes the client ID from all the channels that it's a member of. This
-// prevents messages from being published to that client.
-//
-// In a reversal of earlier behavior, callbacks are now _always_ called,
-// but with an argument that indicates whether or not the destroy actually
-// succeeded.
+/**
+ * Destroys a client and cleans up all associated data.
+ * Removes channel subscriptions, message queue, and client record.
+ * @param {string} clientId - The client ID to destroy.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ *                                Called with (success: boolean).
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<boolean>} Whether the destroy succeeded.
+ */
 Engine.prototype.destroyClient = async function(clientId, callback, context) {
   await this._ensureInitialized();
 
@@ -468,6 +472,11 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
   }
 };
 
+/**
+ * Updates the client's last-seen timestamp.
+ * @param {string} clientId - The client ID to ping.
+ * @returns {Promise<void>}
+ */
 Engine.prototype.ping = async function(clientId) {
   await this._ensureInitialized();
 
@@ -485,6 +494,14 @@ Engine.prototype.ping = async function(clientId) {
   }
 };
 
+/**
+ * Subscribes a client to a channel.
+ * @param {string} clientId - The client ID.
+ * @param {string} channel - The channel to subscribe to.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<void>}
+ */
 Engine.prototype.subscribe = async function(clientId, channel, callback, context) {
   await this._ensureInitialized();
 
@@ -502,12 +519,19 @@ Engine.prototype.subscribe = async function(clientId, channel, callback, context
     if (callback) callback.call(context);
   } catch (error) {
     self._server.error('Failed to subscribe client: ?', error);
-    if (callback) callback.call(context);
     // Don't call callback on error - let the thrown error propagate to Promise-based callers
     throw error;
   }
 };
 
+/**
+ * Unsubscribes a client from a channel.
+ * @param {string} clientId - The client ID.
+ * @param {string} channel - The channel to unsubscribe from.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<void>}
+ */
 Engine.prototype.unsubscribe = async function(clientId, channel, callback, context) {
   await this._ensureInitialized();
 
@@ -525,12 +549,17 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
     if (callback) callback.call(context);
   } catch (error) {
     self._server.error('Failed to unsubscribe client: ?', error);
-    if (callback) callback.call(context);
     // Don't call callback on error - let the thrown error propagate to Promise-based callers
     throw error;
   }
 };
 
+/**
+ * Publishes a message to all subscribed clients on the given channels.
+ * @param {Object} message - The message to publish.
+ * @param {string[]} channels - The channels to publish to.
+ * @returns {Promise<void>}
+ */
 Engine.prototype.publish = async function(message, channels) {
   await this._ensureInitialized();
 
@@ -580,6 +609,11 @@ Engine.prototype.publish = async function(message, channels) {
   this._server.trigger('publish', message.clientId, message.channel, message.data);
 };
 
+/**
+ * Delivers queued messages to a connected client.
+ * @param {string} clientId - The client ID to deliver messages to.
+ * @returns {Promise<void>}
+ */
 Engine.prototype.emptyQueue = async function(clientId) {
   await this._ensureInitialized();
 

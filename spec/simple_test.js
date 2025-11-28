@@ -337,6 +337,8 @@ async function runTests() {
   console.log('\n--- URL Parsing Tests ---');
 
   await test('should parse Redis URL with password', async () => {
+    // Test that engine can be created with password URL
+    // Note: This will attempt to connect but fail auth - we just verify creation works
     const testServer = createMockServer();
     const testEngine = RedisEngine.create(testServer, {
       namespace: 'parse-test-' + Date.now(),
@@ -344,11 +346,17 @@ async function runTests() {
       disable_subscriptions: true,
       gc: false
     });
-    // Just verify it creates without error - actual connection would fail without real auth
     assertTrue(testEngine !== null, 'Engine should be created');
+    // Clean up - disconnect will handle already-closed connections gracefully
+    try {
+      await testEngine.disconnect();
+    } catch (e) {
+      // Expected - connection may have failed due to wrong password
+    }
   });
 
   await test('should parse Redis URL with default port', async () => {
+    // Test URL parsing with missing port (should default to 6379)
     const testServer = createMockServer();
     const testEngine = RedisEngine.create(testServer, {
       namespace: 'parse-test-' + Date.now(),
@@ -357,6 +365,14 @@ async function runTests() {
       gc: false
     });
     assertTrue(testEngine !== null, 'Engine should be created with default port');
+    // Wait for init to complete/fail, then clean up
+    try {
+      await testEngine.init();
+      await testEngine.disconnect();
+    } catch (e) {
+      // Expected if connection fails
+      try { await testEngine.disconnect(); } catch (e2) { /* ignore */ }
+    }
   });
 
   // ============================================
