@@ -254,7 +254,7 @@ var Engine = function(server, options) {
 
   // Auto-initialize on construction (for Faye compatibility)
   // This starts the async connection process immediately
-  this._ensureInitialized();
+  this._ensureInitialized().catch(err => this._server.error('Auto-initialization failed:', err));
 };
 
 Engine.create = function(server, options) {
@@ -276,7 +276,7 @@ Engine.prototype._ensureInitialized = function() {
 
       if (!self._options.disable_subscriptions) {
         await self._redis.subscribe(self._ns + '/notifications', function(topic, message) {
-          self.emptyQueue(message);
+          self.emptyQueue(message).catch(err => self._server.error('Failed to empty queue on notification:', err));
         });
       }
 
@@ -393,7 +393,7 @@ Engine.prototype.clientExists = async function(clientId, callback, context) {
     if (callback) callback.call(context, exists);
     return exists;
   } catch (error) {
-    this._server.error('Failed to check client existence: ?', error);
+    this._server.error('Failed to check client existence: ?', error.message);
     if (callback) callback.call(context, false);
     return false;
   }
@@ -464,7 +464,7 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
     }
     return true;
   } catch (error) {
-    return self._failGC(callback, context, "Failed to remove client ID ? from /clients: ?", clientId, error);
+    return self._failGC(callback, context, "Failed to remove client ID ? from /clients: ?", clientId, error && error.message ? error.message : String(error));
   }
 };
 
@@ -502,6 +502,7 @@ Engine.prototype.subscribe = async function(clientId, channel, callback, context
     if (callback) callback.call(context);
   } catch (error) {
     self._server.error('Failed to subscribe client: ?', error);
+    if (callback) callback.call(context);
     // Don't call callback on error - let the thrown error propagate to Promise-based callers
     throw error;
   }
@@ -524,6 +525,7 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
     if (callback) callback.call(context);
   } catch (error) {
     self._server.error('Failed to unsubscribe client: ?', error);
+    if (callback) callback.call(context);
     // Don't call callback on error - let the thrown error propagate to Promise-based callers
     throw error;
   }
@@ -570,7 +572,7 @@ Engine.prototype.publish = async function(message, channels) {
         // Process clients in parallel for better performance
         await Promise.all(clients.map(notifyClient));
       } catch (error) {
-        self._server.error("Failed to fetch clients, candidate channels ?: ?", keys, error);
+        self._server.error("Failed to fetch clients for channels " + keys.join(', ') + ": " + error.message);
       }
     }
   }
@@ -610,7 +612,9 @@ Engine.prototype.gc = function() {
   this._redis.urls.forEach(function(url) {
     self._server.debug("Starting GC loop for ?", url);
     process.nextTick(function() {
-      self._runGC(url, timeout);
+      self._runGC(url, timeout).catch(function(err) {
+        self._server.error('GC error:', err);
+      });
     });
 
     // Track the number of clients in each shard with a statsd gauge.
@@ -659,7 +663,7 @@ Engine.prototype._runGC = async function(url, timeout) {
     }
 
     process.nextTick(function() {
-      self._runGC(url, timeout);
+      self._runGC(url, timeout).catch(err => self._server.error('GC error:', err));
     });
   } catch (error) {
     self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
