@@ -583,30 +583,43 @@ Engine.prototype.publish = async function(message, channels) {
   this._server.debug('Publishing message ?', message);
 
   var self        = this,
-      notified    = new Set(),
       jsonMessage = JSON.stringify(message),
       keys        = channels.map(function(c) { return self._ns + '/channels' + c; });
 
+  // CRITICAL FIX: Use Redis-based deduplication instead of per-publish Set
+  // This prevents the same expired client from being destroyed multiple times
+  // when multiple publishes happen simultaneously (e.g., presence broadcasts)
   var notifyClient = async function(clientId) {
-    if (notified.has(clientId)) {
-      return;
-    }
-    notified.add(clientId);
+    var lockKey = self._ns + '/publish_notify_lock/' + clientId;
 
-    var exists = await self.clientExists(clientId);
+    try {
+      // Try to acquire a short-lived lock (1 second) for this client notification
+      // NX = only set if doesn't exist, PX = expire after milliseconds
+      var lockAcquired = await self._redis.set(lockKey, Date.now().toString(), { NX: true, PX: 1000 });
 
-    if (exists) {
-      self._server.debug('Queueing for client ?: ?', clientId, message);
-      var messagesKey = self._ns + '/clients/' + clientId + '/messages';
-      // Execute independent Redis operations in parallel for better performance
-      await Promise.all([
-        self._redis.rPush(messagesKey, jsonMessage),
-        self._redis.publish(self._ns + '/notifications', clientId),
-        self._redis.expire(messagesKey, 3600)
-      ]);
-    } else {
-      console.log("[PUBLISH CLEANUP] Found expired client during publish, destroying:", clientId);
-      await self.destroyClient(clientId);
+      if (!lockAcquired) {
+        // Another publish operation is already handling this client
+        console.log('Skipping duplicate notify for client ?', clientId);
+        return;
+      }
+
+      var exists = await self.clientExists(clientId);
+
+      if (exists) {
+        self._server.debug('Queueing for client ?: ?', clientId, message);
+        var messagesKey = self._ns + '/clients/' + clientId + '/messages';
+        // Execute independent Redis operations in parallel for better performance
+        await Promise.all([
+          self._redis.rPush(messagesKey, jsonMessage),
+          self._redis.publish(self._ns + '/notifications', clientId),
+          self._redis.expire(messagesKey, 3600)
+        ]);
+      } else {
+        console.log("[PUBLISH CLEANUP] Found expired client during publish, destroying:", clientId);
+        await self.destroyClient(clientId);
+      }
+    } catch (error) {
+      self._server.error('Failed to notify client ?: ?', clientId, error);
     }
   };
 
