@@ -415,11 +415,14 @@ Engine.prototype.clientExists = async function(clientId, callback, context) {
 Engine.prototype.destroyClient = async function(clientId, callback, context) {
   await this._ensureInitialized();
 
+  console.log("[DESTROY START] destroyClient called for:", clientId);
+
   var self = this;
   var clientChannelsKey = this._ns + "/clients/" + clientId + "/channels";
 
   try {
     var channels = await this._redis.sMembers(clientChannelsKey);
+    console.log("[CHANNELS] Client", clientId, "has", channels.length, "channels to unsubscribe");
 
     if (channels.length === 0) {
       return self._deleteClient(clientId, callback, context);
@@ -428,12 +431,14 @@ Engine.prototype.destroyClient = async function(clientId, callback, context) {
     var unsubscribePromises = channels.map(async function(channel) {
       var channelsKey = self._ns + "/channels" + channel;
       await self._redis.sRem(channelsKey, clientId);
+      console.log("[UNSUBSCRIBE] Client", clientId, "unsubscribed from channel", channel);
       self._server.trigger("unsubscribe", clientId, channel);
     });
 
     await Promise.all(unsubscribePromises);
     return self._deleteClient(clientId, callback, context);
   } catch (error) {
+    console.error("[DESTROY ERROR] Failed to destroy client:", clientId, error);
     return self._failGC(callback, context, "Failed to fetch channels ?: ?", clientChannelsKey, error);
   }
 };
@@ -449,14 +454,25 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
       clientMessagesKey = this._ns + "/clients/" + clientId + "/messages";
 
   try {
+    console.log("[DELETE START] Deleting client data for:", clientId);
+
     // Execute independent Redis delete operations in parallel for better performance
-    await Promise.all([
+    var results = await Promise.all([
       this._redis.del(clientChannelsKey),
       this._redis.del(clientMessagesKey),
       this._redis.zRem(self._ns + "/clients", clientId)
     ]);
 
-    self._server.debug("Destroyed client ? successfully", clientId);
+    var clientRemoved = results[2]; // zRem returns 1 if removed, 0 if not found
+
+    if (clientRemoved === 0) {
+      console.log("[DELETE SKIP] Client was already deleted by another process:", clientId);
+    } else {
+      console.log("[DELETE SUCCESS] Successfully destroyed client:", clientId);
+    }
+
+    console.log("[DISCONNECT EVENT] Triggering disconnect event for:", clientId);
+
     self._server.trigger("disconnect", clientId);
 
     if (self.statsd) {
@@ -468,6 +484,7 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
     }
     return true;
   } catch (error) {
+    console.error("[DELETE ERROR] Failed to delete client:", clientId, error);
     return self._failGC(callback, context, "Failed to remove client ID ? from /clients: ?", clientId, error && error.message ? error.message : String(error));
   }
 };
@@ -588,7 +605,7 @@ Engine.prototype.publish = async function(message, channels) {
         self._redis.expire(messagesKey, 3600)
       ]);
     } else {
-      self._server.debug("Destroying expired client ? from publish", clientId);
+      console.log("[PUBLISH CLEANUP] Found expired client during publish, destroying:", clientId);
       await self.destroyClient(clientId);
     }
   };
@@ -680,27 +697,31 @@ Engine.prototype._runGC = async function(url, timeout) {
       self = this;
 
   try {
+    console.log("[GC QUERY] Querying for expired clients on shard:", url);
     var clients = await conn.zRangeByScore(this._ns + "/clients", 0, cutoff, { LIMIT: { offset: 0, count: 1 } });
 
     if (clients.length === 0) {
-      self._server.debug("[?] No GC clients, retrying in 2 seconds...", url);
+      console.log("[GC IDLE] No expired clients found on shard:", url, "- retrying in 2 seconds");
       return setTimeout(self._runGC.bind(self), 2000, url, timeout);
     }
 
     var clientId = clients[0];
+    console.log("[GC FOUND] Found expired client:", clientId, "on shard:", url);
+
     var success = await self.destroyClient(clientId);
 
     if (success) {
-      self._server.debug("[?] GC succeeded for ?", url, clientId);
+      console.log("[GC SUCCESS] Successfully garbage collected client:", clientId, "on shard:", url);
     } else {
-      self._server.warn("[?] GC failed for ?", url, clientId);
+      console.log("[GC FAILED] Failed to garbage collect client:", clientId, "on shard:", url);
     }
 
+    console.log("[GC LOOP] Immediately checking for next expired client on shard:", url);
     process.nextTick(function() {
-      self._runGC(url, timeout).catch(err => self._server.error('GC error:', err));
+      self._runGC(url, timeout).catch(err => console.error('[GC ERROR]', err));
     });
   } catch (error) {
-    self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
+    console.error("[GC ERROR] Failed to fetch GC client on shard:", url, error);
     return setTimeout(self._runGC.bind(self), 2000, url, timeout);
   }
 };
