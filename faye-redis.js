@@ -208,6 +208,10 @@ multiRedis.prototype = {
     return this.connectionFor(key).get(key);
   },
 
+  set: function(key, value, options) {
+    return this.connectionFor(key).set(key, value, options);
+  },
+
   // zAdd signature in v4+: zAdd(key, { score, value }) or zAdd(key, [{ score, value }])
   //
   // Return value: Returns the number of NEW elements added to the sorted set.
@@ -619,7 +623,7 @@ Engine.prototype.publish = async function(message, channels) {
         await self.destroyClient(clientId);
       }
     } catch (error) {
-      self._server.error('Failed to notify client ?: ?', clientId, error);
+      console.log('Failed to notify client ?: ?', clientId, error);
     }
   };
 
