@@ -471,13 +471,12 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
 
     if (clientRemoved === 0) {
       console.log("[DELETE SKIP] Client was already deleted by another process:", clientId);
+      // Don't trigger disconnect event - another process already handled it
     } else {
       console.log("[DELETE SUCCESS] Successfully destroyed client:", clientId);
+      console.log("[DISCONNECT EVENT] Triggering disconnect event for:", clientId);
+      self._server.trigger("disconnect", clientId);
     }
-
-    console.log("[DISCONNECT EVENT] Triggering disconnect event for:", clientId);
-
-    self._server.trigger("disconnect", clientId);
 
     if (self.statsd) {
       self.statsd.increment("gc.success");
