@@ -419,30 +419,43 @@ Engine.prototype.clientExists = async function(clientId, callback, context) {
 Engine.prototype.destroyClient = async function(clientId, callback, context) {
   await this._ensureInitialized();
 
-  console.log("[DESTROY START] destroyClient called for:", clientId);
+  console.log("[faye-redis] [DESTROY START] destroyClient called for:", clientId);
 
   var self = this;
-  var clientChannelsKey = this._ns + "/clients/" + clientId + "/channels";
+  var lockKey = this._ns + '/destroy_lock/' + clientId;
 
   try {
+    // Try to acquire a lock to prevent concurrent destroyClient calls
+    // This prevents race conditions where multiple calls read the same channel list
+    var lockAcquired = await this._redis.set(lockKey, Date.now().toString(), { NX: true, PX: 5000 });
+
+    if (!lockAcquired) {
+      // Another process is already destroying this client
+      console.log("[faye-redis] [DESTROY SKIP] Client is already being destroyed by another process:", clientId);
+      if (callback) callback.call(context, true);
+      return true;
+    }
+
+    var clientChannelsKey = this._ns + "/clients/" + clientId + "/channels";
     var channels = await this._redis.sMembers(clientChannelsKey);
-    console.log("[CHANNELS] Client", clientId, "has", channels.length, "channels to unsubscribe");
+    console.log("[faye-redis] [CHANNELS] Client", clientId, "has", channels.length, "channels to unsubscribe");
 
     if (channels.length === 0) {
+      console.log("[faye-redis] [UNSUBSCRIBE SKIP] No channels to unsubscribe for client:", clientId);
       return self._deleteClient(clientId, callback, context);
     }
 
     var unsubscribePromises = channels.map(async function(channel) {
       var channelsKey = self._ns + "/channels" + channel;
       await self._redis.sRem(channelsKey, clientId);
-      console.log("[UNSUBSCRIBE] Client", clientId, "unsubscribed from channel", channel);
+      console.log("[faye-redis] [UNSUBSCRIBE] Client", clientId, "unsubscribed from channel", channel);
       self._server.trigger("unsubscribe", clientId, channel);
     });
 
     await Promise.all(unsubscribePromises);
     return self._deleteClient(clientId, callback, context);
   } catch (error) {
-    console.error("[DESTROY ERROR] Failed to destroy client:", clientId, error);
+    console.error("[faye-redis] [DESTROY ERROR] Failed to destroy client:", clientId, error);
     return self._failGC(callback, context, "Failed to fetch channels ?: ?", clientChannelsKey, error);
   }
 };
@@ -458,7 +471,7 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
       clientMessagesKey = this._ns + "/clients/" + clientId + "/messages";
 
   try {
-    console.log("[DELETE START] Deleting client data for:", clientId);
+    console.log("[faye-redis] [DELETE START] Deleting client data for:", clientId);
 
     // Execute independent Redis delete operations in parallel for better performance
     var results = await Promise.all([
@@ -470,11 +483,11 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
     var clientRemoved = results[2]; // zRem returns 1 if removed, 0 if not found
 
     if (clientRemoved === 0) {
-      console.log("[DELETE SKIP] Client was already deleted by another process:", clientId);
+      console.log("[faye-redis] [DELETE SKIP] Client was already deleted by another process:", clientId);
       // Don't trigger disconnect event - another process already handled it
     } else {
-      console.log("[DELETE SUCCESS] Successfully destroyed client:", clientId);
-      console.log("[DISCONNECT EVENT] Triggering disconnect event for:", clientId);
+      console.log("[faye-redis] [DELETE SUCCESS] Successfully destroyed client:", clientId);
+      console.log("[faye-redis] [DISCONNECT EVENT] Triggering disconnect event for:", clientId);
       self._server.trigger("disconnect", clientId);
     }
 
@@ -487,7 +500,7 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
     }
     return true;
   } catch (error) {
-    console.error("[DELETE ERROR] Failed to delete client:", clientId, error);
+    console.error("[faye-redis] [DELETE ERROR] Failed to delete client:", clientId, error);
     return self._failGC(callback, context, "Failed to remove client ID ? from /clients: ?", clientId, error && error.message ? error.message : String(error));
   }
 };
@@ -506,7 +519,7 @@ Engine.prototype.ping = async function(clientId) {
   var time = new Date().getTime();
 
   try {
-    this._server.debug('Ping ?, ?', clientId, time);
+    console.log('[faye-redis] Ping ?, ?', clientId, time);
     await this._redis.zAdd(this._ns + '/clients', time, clientId);
   } catch (error) {
     this._server.error('Failed to ping client ?: ?', clientId, error);
@@ -528,13 +541,14 @@ Engine.prototype.subscribe = async function(clientId, channel, callback, context
   var self = this;
 
   try {
+    // TODO should add a check to see it is already subscribed?
     var added = await this._redis.sAdd(this._ns + '/clients/' + clientId + '/channels', channel);
     if (added === 1) {
       self._server.trigger('subscribe', clientId, channel);
     }
 
     await this._redis.sAdd(this._ns + '/channels' + channel, clientId);
-    self._server.debug('Subscribed client ? to channel ?', clientId, channel);
+    console.log('[faye-redis] Subscribed client ? to channel ?', clientId, channel);
 
     if (callback) callback.call(context);
   } catch (error) {
@@ -552,7 +566,7 @@ Engine.prototype.subscribe = async function(clientId, channel, callback, context
  * @param {Object} [context] - DEPRECATED: The context for the callback.
  * @returns {Promise<void>}
  */
-Engine.prototype.unsubscribe = async function(clientId, channel, callback, context) {
+Engine.prototype.unsubscribe = async function(clientId, channel, callback, context) { // Seems this happen when a client is expired and new one is created
   await this._ensureInitialized();
 
   var self = this;
@@ -564,11 +578,11 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
     }
 
     await this._redis.sRem(this._ns + '/channels' + channel, clientId);
-    self._server.debug('Unsubscribed client ? from channel ?', clientId, channel);
+    console.log('[faye-redis] Unsubscribed client ? from channel ?', clientId, channel);
 
     if (callback) callback.call(context);
   } catch (error) {
-    self._server.error('Failed to unsubscribe client: ?', error);
+    console.log('[faye-redis] Failed to unsubscribe client: ?', error);
     // Don't call callback on error - let the thrown error propagate to Promise-based callers
     throw error;
   }
@@ -589,23 +603,9 @@ Engine.prototype.publish = async function(message, channels) {
       jsonMessage = JSON.stringify(message),
       keys        = channels.map(function(c) { return self._ns + '/channels' + c; });
 
-  // CRITICAL FIX: Use Redis-based deduplication instead of per-publish Set
-  // This prevents the same expired client from being destroyed multiple times
-  // when multiple publishes happen simultaneously (e.g., presence broadcasts)
+  // Notify each client that has messages waiting
   var notifyClient = async function(clientId) {
-    var lockKey = self._ns + '/publish_notify_lock/' + clientId;
-
     try {
-      // Try to acquire a short-lived lock (1 second) for this client notification
-      // NX = only set if doesn't exist, PX = expire after milliseconds
-      var lockAcquired = await self._redis.set(lockKey, Date.now().toString(), { NX: true, PX: 1000 });
-
-      if (!lockAcquired) {
-        // Another publish operation is already handling this client
-        console.log('Skipping duplicate notify for client ?', clientId);
-        return;
-      }
-
       var exists = await self.clientExists(clientId);
 
       if (exists) {
@@ -618,11 +618,11 @@ Engine.prototype.publish = async function(message, channels) {
           self._redis.expire(messagesKey, 3600)
         ]);
       } else {
-        console.log("[PUBLISH CLEANUP] Found expired client during publish, destroying:", clientId);
+        console.log("[faye-redis] [PUBLISH CLEANUP] Found expired client during publish, destroying:", clientId);
         await self.destroyClient(clientId);
       }
     } catch (error) {
-      console.log('Failed to notify client ?: ?', clientId, error);
+      console.log('[faye-redis] Failed to notify client ?: ?', clientId, error);
     }
   };
 
@@ -713,31 +713,31 @@ Engine.prototype._runGC = async function(url, timeout) {
       self = this;
 
   try {
-    console.log("[GC QUERY] Querying for expired clients on shard:", url);
+    
     var clients = await conn.zRangeByScore(this._ns + "/clients", 0, cutoff, { LIMIT: { offset: 0, count: 1 } });
-
+    // console.log("[faye-redis] [GC QUERY] Querying for expired clients on shard:", url, "found:", clients);
     if (clients.length === 0) {
-      console.log("[GC IDLE] No expired clients found on shard:", url, "- retrying in 2 seconds");
+      // console.log("[faye-redis] [GC IDLE] No expired clients found on shard:", url, "- retrying in 2 seconds");
       return setTimeout(self._runGC.bind(self), 2000, url, timeout);
     }
 
     var clientId = clients[0];
-    console.log("[GC FOUND] Found expired client:", clientId, "on shard:", url);
+    console.log("[faye-redis] [GC FOUND] Found expired client:", clientId, "on shard:", url);
 
     var success = await self.destroyClient(clientId);
 
     if (success) {
-      console.log("[GC SUCCESS] Successfully garbage collected client:", clientId, "on shard:", url);
+      console.log("[faye-redis] [GC SUCCESS] Successfully garbage collected client:", clientId, "on shard:", url);
     } else {
-      console.log("[GC FAILED] Failed to garbage collect client:", clientId, "on shard:", url);
+      // console.log("[faye-redis] [GC FAILED] Failed to garbage collect client:", clientId, "on shard:", url);
     }
 
-    console.log("[GC LOOP] Immediately checking for next expired client on shard:", url);
+    console.log("[faye-redis] [GC LOOP] Immediately checking for next expired client on shard:", url);
     process.nextTick(function() {
-      self._runGC(url, timeout).catch(err => console.error('[GC ERROR]', err));
+      self._runGC(url, timeout).catch(err => console.error('[faye-redis] [GC ERROR]', err));
     });
   } catch (error) {
-    console.error("[GC ERROR] Failed to fetch GC client on shard:", url, error);
+    console.error("[faye-redis] [GC ERROR] Failed to fetch GC client on shard:", url, error);
     return setTimeout(self._runGC.bind(self), 2000, url, timeout);
   }
 };
