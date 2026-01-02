@@ -600,11 +600,16 @@ Engine.prototype.publish = async function(message, channels) {
   this._server.debug('Publishing message ?', message);
 
   var self        = this,
+      notified = new Set(),
       jsonMessage = JSON.stringify(message),
       keys        = channels.map(function(c) { return self._ns + '/channels' + c; });
 
   // Notify each client that has messages waiting
   var notifyClient = async function(clientId) {
+    if (notified.has(clientId)) {
+      return;
+    }
+    notified.add(clientId);
     try {
       var exists = await self.clientExists(clientId);
 
