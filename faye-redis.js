@@ -57,6 +57,8 @@ multiRedis.prototype = {
   //
   // IMPORTANT: This method should only be called once per topic. Calling it multiple
   // times will register multiple handlers and cause duplicate message processing.
+  // The caller is responsible for ensuring this method is called only once per topic.
+  // If you need to change the callback, unsubscribe first, then resubscribe.
   //
   // The callback signature is (channel, message) to match the original Faye API.
   // Redis v4+ provides (message, channel), so we swap the arguments.
@@ -299,7 +301,7 @@ Engine.prototype._ensureInitialized = function() {
       self._initialized = true;
       self._server.debug('Redis engine initialized successfully');
     } catch (error) {
-      self._server.error('Failed to initialize Redis engine: ?', error);
+      self._server.error('Failed to initialize Redis engine:', error);
       throw error;
     }
   })();
@@ -388,11 +390,15 @@ Engine.prototype.clientExists = async function(clientId, callback, context) {
 
   try {
     var score = await this._redis.zScore(this._ns + '/clients', clientId);
+    // Ensure score is a number (redis v4+ should return number, but be defensive)
+    if (score !== null) {
+      score = parseFloat(score);
+    }
     var exists;
     if (timeout) {
-      exists = score !== null && score > new Date().getTime() - 1000 * 1.75 * timeout;
+      exists = score !== null && !isNaN(score) && score > new Date().getTime() - 1000 * 1.75 * timeout;
     } else {
-      exists = score !== null;
+      exists = score !== null && !isNaN(score);
     }
     if (callback) callback.call(context, exists);
     return exists;
@@ -598,8 +604,14 @@ Engine.prototype.publish = async function(message, channels) {
     if (key.indexOf("*") === -1) {
       try {
         var clients = await self._redis.sMembers(key);
-        // Process clients in parallel for better performance
-        await Promise.all(clients.map(notifyClient));
+        
+        // Process clients with controlled concurrency to avoid overwhelming Redis
+        // When there are many clients, batch them to prevent creating too many parallel operations
+        var batchSize = 100; // Process up to 100 clients concurrently
+        for (var j = 0; j < clients.length; j += batchSize) {
+          var batch = clients.slice(j, j + batchSize);
+          await Promise.all(batch.map(notifyClient));
+        }
       } catch (error) {
         self._server.error("Failed to fetch clients for channels " + keys.join(', ') + ": " + error.message);
       }
