@@ -594,15 +594,16 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
  * @param {string[]} channels - The channels to publish to.
  * @returns {Promise<void>}
  */
-Engine.prototype.publish = async function(message, channels) {
+Engine.prototype.publish = async function(message, channels, senderClientID = null) {
   await this._ensureInitialized();
 
   this._server.debug('Publishing message ?', message);
 
   var self        = this,
-      notified = new Set(),
+      notified    = new Set(),
       jsonMessage = JSON.stringify(message),
-      keys        = channels.map(function(c) { return self._ns + '/channels' + c; });
+      keys        = channels.map(function(c) { return self._ns + '/channels' + c; }),
+      type        = message.type;
 
   // Notify each client that has messages waiting
   var notifyClient = async function(clientId) {
@@ -610,6 +611,12 @@ Engine.prototype.publish = async function(message, channels) {
       return;
     }
     notified.add(clientId);
+
+    // need to filter out if type is presence update, do not notify to the sender clientID
+    if (type === 'presence.update' && clientId === senderClientID) {
+      return;
+    }
+    
     try {
       var exists = await self.clientExists(clientId);
 
