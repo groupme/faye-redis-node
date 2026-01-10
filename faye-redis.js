@@ -564,7 +564,7 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
 Engine.prototype.publish = async function(message, channels) {
   await this._ensureInitialized();
 
-  this._server.debug('Publishing message ?', message);
+  this.console.log('Publishing message ?', message);
 
   var self        = this,
       notified    = new Set(),
