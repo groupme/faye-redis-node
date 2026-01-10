@@ -413,6 +413,7 @@ Engine.prototype.clientExists = async function(clientId, callback, context) {
  * @returns {Promise<boolean>} Whether the destroy succeeded.
  */
 Engine.prototype.destroyClient = async function(clientId, callback, context) {
+  console.log("V2 Destroying client", clientId);
   await this._ensureInitialized();
 
   var self = this;
@@ -644,10 +645,10 @@ Engine.prototype.gc = function() {
   var self = this;
 
   this._redis.urls.forEach(function(url) {
-    self._server.debug("Starting GC loop for ?", url);
+    console.log("V2 Starting GC loop for", url);
     process.nextTick(function() {
       self._runGC(url, timeout).catch(function(err) {
-        self._server.error('GC error:', err);
+        console.error('V2 GC error:', err);
       });
     });
 
@@ -668,7 +669,7 @@ Engine.prototype.gc = function() {
         }, 10000);
         self._gcIntervals.push(intervalId);
       } catch (e) {
-        self._server.error('Failed to parse URL for stats: ' + e.message);
+        console.error('V2 Failed to parse URL for stats: ' + e.message);
       }
     }
   });
@@ -683,7 +684,7 @@ Engine.prototype._runGC = async function(url, timeout) {
     var clients = await conn.zRangeByScore(this._ns + "/clients", 0, cutoff, { LIMIT: { offset: 0, count: 1 } });
 
     if (clients.length === 0) {
-      self._server.debug("[?] No GC clients, retrying in 2 seconds...", url);
+      console.log("V2 [" + url + "] No GC clients, retrying in 2 seconds...");
       return setTimeout(self._runGC.bind(self), 2000, url, timeout);
     }
 
@@ -691,23 +692,23 @@ Engine.prototype._runGC = async function(url, timeout) {
     var success = await self.destroyClient(clientId);
 
     if (success) {
-      self._server.debug("[?] GC succeeded for ?", url, clientId);
+      console.log("V2 [" + url + "] GC succeeded for", clientId);
     } else {
-      self._server.warn("[?] GC failed for ?", url, clientId);
+      console.warn("V2 [" + url + "] GC failed for", clientId);
     }
 
     process.nextTick(function() {
-      self._runGC(url, timeout).catch(err => self._server.error('GC error:', err));
+      self._runGC(url, timeout).catch(err => console.error('V2 GC error:', err));
     });
   } catch (error) {
-    self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
+    console.error("V2 [" + url + "] Failed to fetch GC client, retrying in 2 seconds...");
     return setTimeout(self._runGC.bind(self), 2000, url, timeout);
   }
 };
 
 // A helper function to log a GC error and invoke the callback (if it exists).
 Engine.prototype._failGC = function(callback, context, msg) {
-  this._server.error.apply(this._server, Array.prototype.slice.call(arguments, 2, arguments.length));
+  console.error.apply(console, Array.prototype.slice.call(arguments, 2, arguments.length));
   if (this.statsd) {
     this.statsd.increment("gc.failure");
   }
