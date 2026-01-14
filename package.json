@@ -12,7 +12,8 @@
   "dependencies": {
     "redis": "^4.7.0",
     "consistent-hashing": "^0.3.0",
-    "node-statsd": "^0.1.1"
+    "node-statsd": "^0.1.1",
+    "hashring": "^3.0.0"
   },
   "devDependencies": {
     "jsclass": "^4.0.0"

@@ -4,7 +4,7 @@
 //
 // Updated for redis v4+ which uses Promises instead of callbacks.
 var multiRedis = function(urls) {
-  var hasher = require('consistent-hashing'),
+  var hasher = require('hashring'),
       self   = this;
 
   self.ring          = new hasher(urls);
@@ -174,7 +174,7 @@ multiRedis.prototype = {
 
   // Returns a connection for a given key.
   connectionFor: function(key) {
-    return this.connections[this.ring.getNode(key)];
+    return this.connections[this.ring.get(key)];
   },
 
   // Redis v4+ command wrappers with proper sharding
