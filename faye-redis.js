@@ -216,16 +216,23 @@ multiRedis.prototype = {
   //
   // This implementation always overwrites existing scores (does not use NX by default).
   // To enable NX behavior (only add if not exists), use: zAdd(key, { score, value }, { NX: true })
+  //
+  // IMPORTANT: Hashes on 'member' (argument 2) to maintain compatibility with old code
+  // and Go implementation. This ensures all operations on the same clientId hit the same shard.
   zAdd: function(key, score, member) {
-    return this.connectionFor(key).zAdd(key, { score: score, value: member });
+    return this.connectionFor(member).zAdd(key, { score: score, value: member });
   },
 
+  // IMPORTANT: Hashes on 'member' (argument 1) to maintain compatibility with old code
+  // and Go implementation. This ensures all operations on the same clientId hit the same shard.
   zRem: function(key, member) {
-    return this.connectionFor(key).zRem(key, member);
+    return this.connectionFor(member).zRem(key, member);
   },
 
+  // IMPORTANT: Hashes on 'member' (argument 1) to maintain compatibility with old code
+  // and Go implementation. This ensures all operations on the same clientId hit the same shard.
   zScore: function(key, member) {
-    return this.connectionFor(key).zScore(key, member);
+    return this.connectionFor(member).zScore(key, member);
   }
 };
 
@@ -564,7 +571,7 @@ Engine.prototype.unsubscribe = async function(clientId, channel, callback, conte
 Engine.prototype.publish = async function(message, channels) {
   await this._ensureInitialized();
 
-  this.console.log('Publishing message ?', message);
+  this.console.log('V2 Publishing message ?', message);
 
   var self        = this,
       notified    = new Set(),
