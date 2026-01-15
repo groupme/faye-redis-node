@@ -687,6 +687,10 @@ Engine.prototype._runGC = async function(url, timeout) {
       cutoff = new Date().getTime() - 1000 * 2 * timeout,
       self = this;
 
+  self._server.debug("NEW LOG DEBUG [" + url + "] No GC clients, retrying in 2 seconds...");
+  self._server.info("NEW LOG INFO [" + url + "] No GC clients, retrying in 2 seconds...");
+  self._server.error("NEW LOG ERROR [" + url + "] No GC clients, retrying in 2 seconds...");
+
   try {
     var clients = await conn.zRangeByScore(this._ns + "/clients", 0, cutoff, { LIMIT: { offset: 0, count: 1 } });
 
