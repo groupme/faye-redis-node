@@ -652,7 +652,6 @@ Engine.prototype.gc = function() {
 
   this._redis.urls.forEach(function(url) {
     self._server.debug("V2 self._server.debug Starting GC loop for", url);
-    self._server.debug("V2 self._server.debug Starting GC loop for", url);
     process.nextTick(function() {
       self._runGC(url, timeout).catch(function(err) {
         self._server.error('V2 GC error:', err);
@@ -690,6 +689,8 @@ Engine.prototype._runGC = async function(url, timeout) {
   self._server.debug("NEW LOG DEBUG [" + url + "] No GC clients, retrying in 2 seconds...");
   self._server.info("NEW LOG INFO [" + url + "] No GC clients, retrying in 2 seconds...");
   self._server.error("NEW LOG ERROR [" + url + "] No GC clients, retrying in 2 seconds...");
+  console.info("NEW INFO CONSOLE [" + url + "] No GC clients, retrying in 2 seconds...");
+  console.log("NEW LOG CONSOLE [" + url + "] No GC clients, retrying in 2 seconds...");
 
   try {
     var clients = await conn.zRangeByScore(this._ns + "/clients", 0, cutoff, { LIMIT: { offset: 0, count: 1 } });
