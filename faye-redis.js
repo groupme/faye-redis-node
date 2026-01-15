@@ -442,7 +442,7 @@ Engine.prototype.destroyClient = async function(clientId, callback, context) {
     await Promise.all(unsubscribePromises);
     return self._deleteClient(clientId, callback, context);
   } catch (error) {
-    return self._failGC(callback, context, "[faye-redis] Failed to fetch channels ?: ?", clientChannelsKey, error);
+    return self._failGC(callback, context, "[faye-redis] Failed to fetch channels " + clientChannelsKey + ": " + error.message);
   }
 };
 
@@ -476,7 +476,7 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
     }
     return true;
   } catch (error) {
-    return self._failGC(callback, context, "[faye-redis] Failed to remove client ID ? from /clients: ?", clientId, error && error.message ? error.message : String(error));
+    return self._failGC(callback, context, "[faye-redis] Failed to remove client ID " + clientId + " from /clients: " + (error && error.message ? error.message : String(error)));
   }
 };
 
