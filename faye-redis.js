@@ -424,7 +424,7 @@ Engine.prototype.destroyClient = async function(clientId, callback, context) {
 
   var self = this;
   var clientChannelsKey = this._ns + "/clients/" + clientId + "/channels";
-  self._server.info("[faye-redis] Destroying client " + clientId);
+  self._server.debug("[faye-redis] Destroying client " + clientId);
 
   try {
     var channels = await this._redis.sMembers(clientChannelsKey);
@@ -464,7 +464,7 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
       this._redis.zRem(self._ns + "/clients", clientId)
     ]);
 
-    self._server.info("[faye-redis] Destroyed client " + clientId + " successfully");
+    self._server.debug("[faye-redis] Destroyed client " + clientId + " successfully");
     self._server.trigger("disconnect", clientId);
 
     if (self.statsd) {
@@ -651,7 +651,7 @@ Engine.prototype.gc = function() {
   var self = this;
 
   this._redis.urls.forEach(function(url) {
-    self._server.info("[faye-redis] Starting GC loop for " + url);
+    self._server.debug("[faye-redis] Starting GC loop for " + url);
     process.nextTick(function() {
       self._runGC(url, timeout).catch(function(err) {
         self._server.error('[faye-redis] GC error:', err);
@@ -686,25 +686,25 @@ Engine.prototype._runGC = async function(url, timeout) {
       cutoff = new Date().getTime() - 1000 * 2 * timeout,
       self = this;
 
-  self._server.info("[faye-redis] [" + url + "] _runGC called, cutoff: " + cutoff);
+  self._server.debug("[faye-redis] [" + url + "] _runGC called, cutoff: " + cutoff);
 
   try {
     var clients = await conn.zRangeByScore(this._ns + "/clients", 0, cutoff, { LIMIT: { offset: 0, count: 1 } });
 
-    self._server.info("[faye-redis] [" + url + "] Found " + clients.length + " expired clients");
+    self._server.debug("[faye-redis] [" + url + "] Found " + clients.length + " expired clients");
 
     if (clients.length === 0) {
-      self._server.info("[faye-redis] [" + url + "] No GC clients, retrying in 2 seconds...");
+      self._server.debug("[faye-redis] [" + url + "] No GC clients, retrying in 2 seconds...");
       return setTimeout(self._runGC.bind(self), 2000, url, timeout);
     }
 
     var clientId = clients[0];
-    self._server.info("[faye-redis] [" + url + "] Attempting to destroy client: " + clientId);
+    self._server.debug("[faye-redis] [" + url + "] Attempting to destroy client: " + clientId);
 
     var success = await self.destroyClient(clientId);
 
     if (success) {
-      self._server.info("[faye-redis] [" + url + "] GC succeeded for " + clientId);
+      self._server.debug("[faye-redis] [" + url + "] GC succeeded for " + clientId);
     } else {
       self._server.error("[faye-redis] [" + url + "] GC failed for " + clientId);
     }
