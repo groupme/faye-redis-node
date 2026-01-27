@@ -467,7 +467,7 @@ Engine.prototype._deleteClient = async function(clientId, callback, context) {
     self._server.trigger("disconnect", clientId);
 
     if (self.statsd) {
-      self.statsd.increment("gc.success");
+      self.statsd.increment("faye_redis.gc_success");
     }
 
     if (callback) {
@@ -662,12 +662,13 @@ Engine.prototype.gc = function() {
       try {
         var host = new URL(url).hostname.replace(/\./g, '_'),
             conn = self._redis.connections[url],
-            statKey = "clients." + host;
+            key = "faye_redis.clients",
+            tag = "backend:" + host;
 
         var intervalId = setInterval(async function() {
           try {
             var n = await conn.zCard(self._ns + "/clients");
-            self.statsd.gauge(statKey, n);
+            self.statsd.gauge(key, n, 1, [tag]);
           } catch (error) {
             // Ignore errors
           }
@@ -726,7 +727,7 @@ Engine.prototype._failGC = function(callback, context, msg) {
   }
   this._server.error.apply(this._server, args);
   if (this.statsd) {
-    this.statsd.increment("gc.failure");
+    this.statsd.increment("faye_redis.gc_failure");
   }
   if (callback) {
     callback.call(context, false);
