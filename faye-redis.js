@@ -288,14 +288,15 @@ Engine.prototype._ensureInitialized = function() {
       }
 
       if (self._options.gc) {
-        if (process.env.DD_AGENT_HOST) {
+        if (process.env.STATSD_URL) {
           try {
             var statsd = require("node-statsd").StatsD;
 
+            var statsdUrl = new URL(process.env.STATSD_URL);
             var prefix = "push." + process.env.NODE_ENV + ".";
-            self.statsd = new statsd(process.env.DD_AGENT_HOST, 8125, prefix);
+            self.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
           } catch (e) {
-            self._server.error('[faye-redis] Failed to initialize StatsD: ' + e.message);
+            self._server.error('[faye-redis] Invalid STATSD_URL, disabling StatsD: ' + e.message);
           }
         }
 
