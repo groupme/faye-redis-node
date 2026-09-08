@@ -1,66 +1,91 @@
 // Constructor for multiRedis. It sets up two connections for each provided
-// Redis URL and adds them to a ketema ring. One connection is used for
+// Redis URL and adds them to a ketama ring. One connection is used for
 // commands and the other is used for pub/sub subscriptions.
+//
+// Updated for redis v4+ which uses Promises instead of callbacks.
 var multiRedis = function(urls) {
-  var hasher = require('consistent-hashing'),
+  var hasher = require('hashring'),
       self   = this;
 
   self.ring          = new hasher(urls);
   self.urls          = urls;
   self.connections   = {};
   self.subscriptions = {};
-
-  urls.forEach(function(url) {
-    var options = self.parse(url);
-
-    var connection   = self.connect(options);
-    var subscription = self.connect(options);
-
-    self.connections[url]   = connection;
-    self.subscriptions[url] = subscription;
-  });
+  self.topicSubscriptions = Object.create(null);
+  self._ready        = false;
+  self._readyPromise = null;
 };
 
-// [ command, argument-to-shard-against ]
-multiRedis.COMMANDS = [
-  ['smembers', 0],
-  ['del', 0],
-  ['sadd', 0],
-  ['srem', 0],
-  ['rpush', 0],
-  ['expire', 0],
-  ['get', 0],
-  ['getset', 0],
-  ['zrem', 1],
-  ['zadd', 2],
-  ['zscore', 1]
-];
-
 multiRedis.prototype = {
+  // Initialize all Redis connections (must be called before using the client)
+  init: async function() {
+    var self = this;
+
+    if (self._readyPromise) {
+      return self._readyPromise;
+    }
+
+    self._readyPromise = self._performInitialization();
+    return self._readyPromise;
+  },
+
+  _performInitialization: async function() {
+    for (var i = 0; i < this.urls.length; i++) {
+      var url = this.urls[i];
+      var options = this.parse(url);
+
+      var connection = await this.connect(options);
+      var subscription = await this.connectSubscriber(options);
+
+      this.connections[url] = connection;
+      this.subscriptions[url] = subscription;
+    }
+    this._ready = true;
+  },
+
   // Grab the connection from the ring for the pub/sub server for the message
   // and delegate a publish call to it.
-  publish: function(topic, message) {
+  publish: async function(topic, message) {
     var connection = this.connectionFor(message);
-
-    connection.publish.apply(connection, arguments);
+    return connection.publish(topic, message);
   },
 
   // Subscribe to the topic on all of the subscription connections and call
   // the callback on a new message.
+  //
+  // Note: When multiple Redis servers are configured, this subscribes to all of them.
+  // Messages are sharded by key, so each message only exists on one server.
+  // This ensures we receive notifications regardless of which shard published them.
+  //
+  // Repeated calls for the same topic share the original subscription Promise and
+  // handler, preventing duplicate message processing.
+  //
+  // The callback signature is (channel, message) to match the original Faye API.
+  // Redis v4+ provides (message, channel), so we swap the arguments.
   subscribe: function(topic, callback) {
-    var self = this;
+    if (this.topicSubscriptions[topic]) {
+      return this.topicSubscriptions[topic];
+    }
 
-    self.urls.forEach(function(url) {
-      var subscription = self.subscriptions[url];
-
-      subscription.subscribe(topic);
-      subscription.on('message', callback);
-    });
+    this.topicSubscriptions[topic] = this._performSubscription(topic, callback);
+    return this.topicSubscriptions[topic];
   },
 
-  // Returns a connection based on a single key for dispatching multiple
-  // connections atomically. You should only commit operations against a single
-  // key during a multi due to the sharding.
+  _performSubscription: async function(topic, callback) {
+    for (var i = 0; i < this.urls.length; i++) {
+      var url = this.urls[i];
+      var subscription = this.subscriptions[url];
+
+      // Redis v4+ callback is (message, channel), but Faye expects (channel, message)
+      await subscription.subscribe(topic, function(message, channel) {
+        callback(channel, message);
+      });
+    }
+  },
+
+  // Returns a multi/transaction object for the connection that handles the given key.
+  // Use this when you need to execute multiple commands atomically on the same shard.
+  // Note: In redis v4+, multi() takes no arguments; the key is only used to select the connection.
   multi: function(key) {
     return this.connectionFor(key).multi();
   },
@@ -72,30 +97,58 @@ multiRedis.prototype = {
   //   hostname: 'localhost',
   //   database: 0,
   //   password: 'chunkybacon' }
-  connect: function(server) {
-    var redis      = require('redis'),
-        connection = redis.createClient(server.port, server.hostname);
+  connect: async function(server, errorLabel) {
+    var redis = require('redis');
+    var label = errorLabel || 'Redis Client';
 
-    connection.select(server.database);
+    var clientOptions = {
+      socket: {
+        host: server.hostname,
+        port: server.port
+      },
+      database: parseInt(server.database, 10) || 0
+    };
 
-    if (server.password)
-      connection.auth(server.password);
+    if (server.password) {
+      clientOptions.password = server.password;
+    }
 
-    return connection;
+    var client = redis.createClient(clientOptions);
+
+    client.on('error', function(err) {
+      this._server.error(label + ' Error:', err);
+    });
+
+    await client.connect();
+    return client;
+  },
+
+  // Creates a subscriber connection (separate from command connection in redis v4+)
+  connectSubscriber: function(server) {
+    return this.connect(server, 'Redis Subscriber');
   },
 
   // Parses a URL and returns a server configuration object, e.g.:
   //
   // redis://:chunkybacon@localhost:6379/0
-  parse: function(url) {
-    var url        = require('url').parse(url),
-        connection = { hostname: url.hostname, port: url.port };
+  //
+  // Throws an error if the URL is malformed.
+  parse: function(redisUrl) {
+    var parsedUrl;
+    try {
+      parsedUrl = new URL(redisUrl);
+    } catch (e) {
+      throw new Error('Invalid Redis URL: ' + redisUrl + ' - ' + e.message);
+    }
 
-    if (url.auth)
-      connection.password = url.auth.split(":")[1];
+    var connection = { hostname: parsedUrl.hostname, port: parseInt(parsedUrl.port, 10) || 6379 };
 
-    if (url.path) {
-      connection.database = url.path.substring(1);
+    if (parsedUrl.password) {
+      connection.password = parsedUrl.password;
+    }
+
+    if (parsedUrl.pathname && parsedUrl.pathname.length > 1) {
+      connection.database = parsedUrl.pathname.substring(1);
     } else {
       connection.database = 0;
     }
@@ -104,33 +157,129 @@ multiRedis.prototype = {
   },
 
   // Closes all connections to Redis.
-  end: function() {
+  end: async function() {
     var self = this;
 
-    self.urls.forEach(function(url) {
-      self.connections[url].end();
+    for (var i = 0; i < self.urls.length; i++) {
+      var url = self.urls[i];
 
-      self.subscriptions[url].unsubscribe();
-      self.subscriptions[url].end();
-    });
+      try {
+        if (self.connections[url]) {
+          await self.connections[url].quit();
+        }
+      } catch (e) {
+        // Connection may already be closed
+      }
+
+      try {
+        if (self.subscriptions[url]) {
+          await self.subscriptions[url].quit();
+        }
+      } catch (e) {
+        // Connection may already be closed
+      }
+    }
+    self.topicSubscriptions = Object.create(null);
   },
 
   // Returns a connection for a given key.
   connectionFor: function(key) {
-    return this.connections[this.ring.getNode(key)];
+    return this.connections[this.ring.get(key)];
+  },
+
+  // Redis v4+ command wrappers with proper sharding
+  // Note: redis v4+ uses camelCase method names
+
+  sMembers: function(key) {
+    return this.connectionFor(key).sMembers(key);
+  },
+
+  del: function(key) {
+    return this.connectionFor(key).del(key);
+  },
+
+  sAdd: function(key, member) {
+    return this.connectionFor(key).sAdd(key, member);
+  },
+
+  sRem: function(key, member) {
+    return this.connectionFor(key).sRem(key, member);
+  },
+
+  rPush: function(key, value) {
+    return this.connectionFor(key).rPush(key, value);
+  },
+
+  expire: function(key, seconds) {
+    return this.connectionFor(key).expire(key, seconds);
+  },
+
+  get: function(key) {
+    return this.connectionFor(key).get(key);
+  },
+
+  // zAdd signature in v4+: zAdd(key, { score, value }) or zAdd(key, [{ score, value }])
+  //
+  // Return value: Returns the number of NEW elements added to the sorted set.
+  // If the member already exists, its score is updated but the return value is 0.
+  // This is important for collision detection in createClient().
+  //
+  // This implementation always overwrites existing scores (does not use NX by default).
+  // To enable NX behavior (only add if not exists), use: zAdd(key, { score, value }, { NX: true })
+  //
+  // IMPORTANT: Hashes on 'member' (argument 2) to maintain compatibility with old code
+  // and Go implementation. This ensures all operations on the same clientId hit the same shard.
+  zAdd: function(key, score, member) {
+    return this.connectionFor(member).zAdd(key, { score: score, value: member });
+  },
+
+  // IMPORTANT: Hashes on 'member' (argument 1) to maintain compatibility with old code
+  // and Go implementation. This ensures all operations on the same clientId hit the same shard.
+  zRem: function(key, member) {
+    return this.connectionFor(member).zRem(key, member);
+  },
+
+  // IMPORTANT: Hashes on 'member' (argument 1) to maintain compatibility with old code
+  // and Go implementation. This ensures all operations on the same clientId hit the same shard.
+  zScore: function(key, member) {
+    return this.connectionFor(member).zScore(key, member);
   }
 };
 
-// Loops through the commands and adds each one to multiRedis.
-multiRedis.COMMANDS.forEach(function(command) {
-  var redisCommand = command[0],
-      argument = command[1];
-
-  multiRedis.prototype[redisCommand] = function() {
-    var connection = this.connectionFor(arguments[argument]);
-    return connection[redisCommand].apply(connection, arguments);
+var runWorker = async function(state) {
+  while (state.nextIndex < state.items.length) {
+    var index = state.nextIndex;
+    state.nextIndex += 1;
+    await state.iteratee(state.items[index]);
   }
-});
+};
+
+var runWithConcurrency = async function(items, concurrency, iteratee) {
+  var workerCount = Math.min(items.length, concurrency);
+  var state = {
+    items: items,
+    iteratee: iteratee,
+    nextIndex: 0
+  };
+  var workers = [];
+
+  for (var i = 0; i < workerCount; i++) {
+    workers.push(runWorker(state));
+  }
+
+  await Promise.all(workers);
+};
+
+var normalizeRedisScore = function(score) {
+  if (typeof score === 'number') {
+    return Number.isFinite(score) ? score : null;
+  }
+  if (typeof score === 'string' && score.trim() !== '') {
+    var parsed = Number(score);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
 
 // Creates a new Faye Redis engine.
 //
@@ -143,6 +292,9 @@ multiRedis.COMMANDS.forEach(function(command) {
 //                         probably only want to set this in a dedicated GC
 //                         process.
 //
+//   publish_concurrency   Maximum number of clients processed concurrently for
+//                         each published channel. Defaults to 50.
+//
 var Engine = function(server, options) {
   this._options = options || {};
 
@@ -151,293 +303,495 @@ var Engine = function(server, options) {
   this._server     = server;
   this._ns         = this._options.namespace || '';
   this._redis      = new multiRedis(options.servers);
+  this._initialized = false;
+  this._initPromise = null;
+  this._gcIntervals = [];
+  this._publishConcurrency = this._normalizePublishConcurrency(this._options.publish_concurrency);
 
-  if (!this._options.disable_subscriptions) {
-    this._redis.subscribe(this._ns + '/notifications', function(topic, message) {
-      self.emptyQueue(message);
-    });
-  }
-
-  if (this._options.gc) {
-    if (process.env.STATSD_URL) {
-      var url = require("url");
-      var statsd = require("node-statsd").StatsD;
-
-      var statsdUrl = url.parse(process.env.STATSD_URL);
-      var prefix = "push." + process.env.NODE_ENV + ".";
-      this.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
-    }
-
-    this.gc();
-  }
+  // Auto-initialize on construction (for Faye compatibility)
+  // This starts the async connection process immediately
+  this._ensureInitialized().catch(err => this._server.error('Auto-initialization failed:', err));
 };
 
 Engine.create = function(server, options) {
   return new this(server, options);
 };
 
-Engine.prototype = {
-  DEFAULT_GC:       60,
-  LOCK_TIMEOUT:     120,
+// Ensures the engine is initialized, starting initialization if needed.
+// Returns a promise that resolves when initialization is complete.
+Engine.prototype._ensureInitialized = function() {
+  if (this._initPromise) {
+    return this._initPromise;
+  }
 
-  disconnect: function() {
-    this._redis.end();
-    clearInterval(this._gc);
-  },
+  this._initPromise = this._performInitialization();
+  return this._initPromise;
+};
 
-  createClient: function(callback, context) {
-    var clientId = this._server.generateId(),
-        score = new Date().getTime(),
-        self = this;
+Engine.prototype._performInitialization = async function() {
+  try {
+    await this._redis.init();
 
-    this._redis.zadd(this._ns + '/clients', score, clientId, function(error, added) {
-      if (added === 0) return self.createClient(callback, context);
-      self._server.debug('Created new client ? with score ?', clientId, score);
-      self._server.trigger('handshake', clientId);
-      callback.call(context, clientId);
-    });
-  },
-
-  clientExists: function(clientId, callback, context) {
-    var timeout = this._server.timeout;
-
-    if (clientId === undefined) {
-      this._server.debug("[RedisEngine#clientExists] undefined clientId, returning false");
-      return callback.call(context, false);
+    if (!this._options.disable_subscriptions) {
+      var self = this;
+      await this._redis.subscribe(this._ns + '/notifications', function(topic, message) {
+        self.emptyQueue(message).catch(err => self._server.error('[faye-redis] Failed to empty queue on notification:', err));
+      });
     }
 
-    this._redis.zscore(this._ns + '/clients', clientId, function(error, score) {
-      if (timeout) {
-        callback.call(context, score > new Date().getTime() - 1000 * 1.75 * timeout);
-      } else {
-        callback.call(context, score !== null);
-      }
-    });
-  },
+    if (this._options.gc) {
+      if (process.env.STATSD_URL) {
+        try {
+          var statsd = require("node-statsd").StatsD;
 
-  // Destroy a client.
-  //
-  // The first part of cleaning up a client is removing subscriptions, which
-  // removes the client ID from all the channels that it's a member of. This
-  // prevents messages from being published to that client.
-  //
-  // In a reversal of earlier behavior, callbacks are now _always_ called,
-  // but with an argument that indicates whether or not the destroy actually
-  // succeeded.
-  destroyClient: function(clientId, callback, context) {
-    var self = this;
-    var clientChannelsKey = this._ns + "/clients/" + clientId + "/channels";
-
-    this._redis.smembers(clientChannelsKey, function(error, channels) {
-      if (error) {
-        return self._failGC(callback, context, "Failed to fetch channels ?: ?", clientChannelsKey, error);
-      }
-
-      var numChannels = channels.length, numUnsubscribes = 0;
-
-      if (numChannels == 0) {
-        return self._deleteClient(clientId, callback, context);
-      }
-
-      channels.forEach(function(channel) {
-        var channelsKey = self._ns + "/channels" + channel;
-        self._redis.srem(channelsKey, clientId, function(error, res) {
-          if (error) {
-            return self._failGC(callback, context, "Failed to remove client ? from ?: ?", clientId, channelsKey, error);
-          }
-          numUnsubscribes += 1;
-          self._server.trigger("unsubscribe", clientId, channel);
-          if (numUnsubscribes == numChannels) {
-            self._deleteClient(clientId, callback, context);
-          }
-        });
-      });
-    });
-  },
-
-  // Removes the client bookkeeping records.
-  //
-  // Finishes client cleanup by removing the mailbox, channel set, and finally
-  // the client ID from the sorted set. Once again, any Redis errors shut down
-  // the callback chain, and we'll rely on GC to pick it back up again.
-  _deleteClient: function(clientId, callback, context) {
-    var self = this,
-        clientChannelsKey = this._ns + "/clients/" + clientId + "/channels",
-        clientMessagesKey = this._ns + "/clients/" + clientId + "/messages";
-
-    this._redis.del(clientChannelsKey);
-    this._redis.del(clientMessagesKey);
-    this._redis.zrem(self._ns + "/clients", clientId, function(error, res) {
-      if (error) {
-        return self._failGC(callback, context, "Failed to remove client ID ? from /clients: ?", clientId, error);
-      }
-      self._server.debug("Destroyed client ? successfully", clientId);
-      self._server.trigger("disconnect", clientId);
-      if (self.statsd) {
-        self.statsd.increment("gc.success");
-      }
-      if (callback) {
-        callback.call(context, true);
-      }
-    });
-  },
-
-  ping: function(clientId) {
-    var timeout = this._server.timeout;
-    if (typeof timeout !== 'number') return;
-
-    var time = new Date().getTime();
-
-    this._server.debug('Ping ?, ?', clientId, time);
-    this._redis.zadd(this._ns + '/clients', time, clientId);
-  },
-
-  subscribe: function(clientId, channel, callback, context) {
-    var self = this;
-    this._redis.sadd(this._ns + '/clients/' + clientId + '/channels', channel, function(error, added) {
-      if (added === 1) self._server.trigger('subscribe', clientId, channel);
-    });
-    this._redis.sadd(this._ns + '/channels' + channel, clientId, function() {
-      self._server.debug('Subscribed client ? to channel ?', clientId, channel);
-      if (callback) callback.call(context);
-    });
-  },
-
-  unsubscribe: function(clientId, channel, callback, context) {
-    var self = this;
-    this._redis.srem(this._ns + '/clients/' + clientId + '/channels', channel, function(error, removed) {
-      if (removed === 1) self._server.trigger('unsubscribe', clientId, channel);
-    });
-    this._redis.srem(this._ns + '/channels' + channel, clientId, function() {
-      self._server.debug('Unsubscribed client ? from channel ?', clientId, channel);
-      if (callback) callback.call(context);
-    });
-  },
-
-  publish: function(message, channels) {
-    this._server.debug('Publishing message ?', message);
-
-    var self        = this,
-        notified    = [],
-        jsonMessage = JSON.stringify(message),
-        keys        = channels.map(function(c) { return self._ns + '/channels' + c });
-
-    var notify = function(error, clients) {
-      if (error) {
-        return self._server.error("Failed to fetch clients, candidate channels ?: ?", keys, error);
-      }
-      clients.forEach(function(clientId) {
-        if (notified.indexOf(clientId) == -1) {
-          self.clientExists(clientId, function(exists) {
-            if (exists) {
-              self._server.debug('Queueing for client ?: ?', clientId, message);
-              self._redis.rpush(self._ns + '/clients/' + clientId + '/messages', jsonMessage);
-              self._redis.publish(self._ns + '/notifications', clientId);
-              self._redis.expire(self._ns + '/clients/' + clientId + '/messages', 3600)
-
-              notified.push(clientId);
-            } else {
-              self._server.debug("Destroying expired client ? from publish", clientId);
-              self.destroyClient(clientId);
-            }
-          });
+          var statsdUrl = new URL(process.env.STATSD_URL);
+          var prefix = "push." + process.env.NODE_ENV + ".";
+          this.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
+        } catch (e) {
+          this._server.error('[faye-redis] Invalid STATSD_URL, disabling StatsD: ' + e.message);
         }
-      });
-    };
-
-    keys.forEach(function(key) {
-      if (key.indexOf("*") == -1)
-        self._redis.smembers(key, notify);
-    });
-
-    this._server.trigger('publish', message.clientId, message.channel, message.data);
-  },
-
-  emptyQueue: function(clientId) {
-    if (!this._server.hasConnection(clientId)) return;
-
-    var key   = this._ns + '/clients/' + clientId + '/messages',
-        multi = this._redis.multi(key),
-        self  = this;
-
-    multi.lrange(key, 0, -1, function(error, jsonMessages) {
-      var messages = jsonMessages.map(function(json) { return JSON.parse(json) });
-      self._server.deliver(clientId, messages);
-    });
-    multi.del(key);
-    multi.exec();
-  },
-
-  gc: function() {
-    var timeout = this._server.timeout;
-    if (typeof timeout !== 'number') return;
-
-    var self = this;
-
-    this._redis.urls.forEach(function(url) {
-      this._server.debug("Starting GC loop for ?", url);
-      process.nextTick(function() {
-        this._runGC(url, timeout);
-      }.bind(this));
-
-      // Track the number of clients in each shard with a statsd gauge.
-      if (this.statsd) {
-        var host = require("url").parse(url).hostname.replace(/\./g, '_'),
-            conn = this._redis.connections[url],
-            self = this,
-            key = "clients." + host;
-
-        setInterval(function() {
-          conn.zcard(self._ns + "/clients", function(error, n) {
-            if (!error) {
-              self.statsd.gauge(key, n);
-            }
-          });
-        }, 10000);
-      }
-    }, this);
-  },
-
-  _runGC: function(url, timeout) {
-    var conn = this._redis.connections[url],
-        cutoff = new Date().getTime() - 1000 * 2 * timeout,
-        self = this;
-
-    conn.zrangebyscore(this._ns + "/clients", 0, cutoff, "LIMIT", 0, 1, function(error, clients) {
-      if (error) {
-        self._server.error("[?] Failed to fetch GC client, retrying in 2 seconds...", url);
-        return setTimeout(self._runGC.bind(self), 2000, url, timeout);
       }
 
-      if (clients.length == 0) {
-        self._server.debug("[?] No GC clients, retrying in 2 seconds...", url);
-        return setTimeout(self._runGC.bind(self), 2000, url, timeout);
-      }
-
-      var clientId = clients[0];
-      self.destroyClient(clientId, function(success) {
-        if (success) {
-          self._server.debug("[?] GC succeeded for ?", url, clientId);
-        } else {
-          self._server.warn("[?] GC failed for ?", url, clientId);
-        }
-        process.nextTick(function() {
-          self._runGC(url, timeout);
-        }.bind(self));
-      });
-    });
-  },
-
-  // A helper function to log a GC error and invoke the callback (if it exists).
-  _failGC: function(callback, context, msg) {
-    this._server.error.apply(this._server, Array.prototype.slice.call(arguments, 2, arguments.length));
-    if (this.statsd) {
-      this.statsd.increment("gc.failure");
+      this.gc();
     }
-    if (callback) {
-      callback.call(context, false);
+
+    this._initialized = true;
+    this._server.debug('[faye-redis] Redis engine initialized successfully');
+  } catch (error) {
+    this._server.error('[faye-redis] Failed to initialize Redis engine:', error);
+    throw error;
+  }
+};
+
+// Public init method for explicit initialization (also used by tests)
+Engine.prototype.init = function() {
+  return this._ensureInitialized();
+};
+
+Engine.prototype.DEFAULT_GC = 60;
+Engine.prototype.LOCK_TIMEOUT = 120;
+Engine.prototype.DEFAULT_PUBLISH_CONCURRENCY = 50;
+
+Engine.prototype._normalizePublishConcurrency = function(value) {
+  var parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0
+    ? parsed
+    : this.DEFAULT_PUBLISH_CONCURRENCY;
+};
+
+Engine.prototype.disconnect = async function() {
+  await this._redis.end();
+  if (this._gcIntervals) {
+    this._gcIntervals.forEach(function(intervalId) {
+      clearInterval(intervalId);
+    });
+    this._gcIntervals = [];
+  }
+};
+
+/**
+ * Creates a new client and registers it with the server.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ *                                Called with (clientId) on success.
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<string>} The new client ID.
+ * @throws {Error} If a unique client ID cannot be generated after 10 attempts.
+ */
+Engine.prototype.createClient = async function(callback, context) {
+  await this._ensureInitialized();
+
+  var self = this;
+  // Maximum retry attempts for client ID collision.
+  // With random 9-character IDs, collisions are extremely rare.
+  // 10 retries provides ample safety margin.
+  var maxRetries = 10;
+
+  for (var attempt = 0; attempt < maxRetries; attempt++) {
+    var clientId = this._server.generateId();
+    var score = new Date().getTime();
+
+    try {
+      var added = await this._redis.zAdd(this._ns + '/clients', score, clientId);
+      if (added === 1) {
+        self._server.debug('[faye-redis] Created new client ' + clientId + ' with score ' + score);
+        self._server.trigger('handshake', clientId);
+        if (callback) callback.call(context, clientId);
+        return clientId;
+      }
+      // added === 0 means clientId already exists (collision), try again
+      self._server.debug('[faye-redis] Client ID collision, retrying... attempt ' + (attempt + 1));
+    } catch (error) {
+      self._server.error('[faye-redis] Failed to create client:', error);
+      throw error;
     }
   }
+
+  var error = new Error('Failed to create unique client ID after ' + maxRetries + ' attempts');
+  self._server.error('[faye-redis] Failed to create client:', error);
+  throw error;
+};
+
+/**
+ * Checks if a client exists and is not expired.
+ * @param {string} clientId - The client ID to check.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ *                                Called with (exists: boolean).
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<boolean>} Whether the client exists.
+ */
+Engine.prototype.clientExists = async function(clientId, callback, context) {
+  await this._ensureInitialized();
+
+  var timeout = this._server.timeout;
+
+  if (clientId === undefined) {
+    this._server.debug("[faye-redis] [RedisEngine#clientExists] undefined clientId, returning false");
+    if (callback) callback.call(context, false);
+    return false;
+  }
+
+  try {
+    var redisScore = await this._redis.zScore(this._ns + '/clients', clientId);
+    var score = normalizeRedisScore(redisScore);
+    var exists;
+    if (timeout) {
+      exists = score !== null && score > new Date().getTime() - 1000 * 1.75 * timeout;
+    } else {
+      exists = score !== null;
+    }
+    if (callback) callback.call(context, exists);
+    return exists;
+  } catch (error) {
+    this._server.error('[faye-redis] Failed to check client existence:', error.message);
+    if (callback) callback.call(context, false);
+    return false;
+  }
+};
+
+/**
+ * Destroys a client and cleans up all associated data.
+ * Removes channel subscriptions, message queue, and client record.
+ * @param {string} clientId - The client ID to destroy.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ *                                Called with (success: boolean).
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<boolean>} Whether the destroy succeeded.
+ */
+Engine.prototype.destroyClient = async function(clientId, callback, context) {
+  await this._ensureInitialized();
+
+  var self = this;
+  var clientChannelsKey = this._ns + "/clients/" + clientId + "/channels";
+  self._server.debug("[faye-redis] Destroying client " + clientId);
+
+  try {
+    var channels = await this._redis.sMembers(clientChannelsKey);
+
+    if (channels.length === 0) {
+      return self._deleteClient(clientId, callback, context);
+    }
+
+    var unsubscribePromises = channels.map(async function(channel) {
+      var channelsKey = self._ns + "/channels" + channel;
+      await self._redis.sRem(channelsKey, clientId);
+      self._server.trigger("unsubscribe", clientId, channel);
+    });
+
+    await Promise.all(unsubscribePromises);
+    return self._deleteClient(clientId, callback, context);
+  } catch (error) {
+    return self._failGC(callback, context, "[faye-redis] Failed to fetch channels " + clientChannelsKey + ": " + error.message);
+  }
+};
+
+// Removes the client bookkeeping records.
+//
+// Finishes client cleanup by removing the mailbox, channel set, and finally
+// the client ID from the sorted set. Once again, any Redis errors shut down
+// the callback chain, and we'll rely on GC to pick it back up again.
+Engine.prototype._deleteClient = async function(clientId, callback, context) {
+  var self = this,
+      clientChannelsKey = this._ns + "/clients/" + clientId + "/channels",
+      clientMessagesKey = this._ns + "/clients/" + clientId + "/messages";
+
+  try {
+    // Execute independent Redis delete operations in parallel for better performance
+    await Promise.all([
+      this._redis.del(clientChannelsKey),
+      this._redis.del(clientMessagesKey),
+      this._redis.zRem(self._ns + "/clients", clientId)
+    ]);
+
+    self._server.debug("[faye-redis] Destroyed client " + clientId + " successfully");
+    self._server.trigger("disconnect", clientId);
+
+    if (self.statsd) {
+      self.statsd.increment("faye_redis.gc_success");
+    }
+
+    if (callback) {
+      callback.call(context, true);
+    }
+    return true;
+  } catch (error) {
+    return self._failGC(callback, context, "[faye-redis] Failed to remove client ID " + clientId + " from /clients: " + (error && error.message ? error.message : String(error)));
+  }
+};
+
+/**
+ * Updates the client's last-seen timestamp.
+ * @param {string} clientId - The client ID to ping.
+ * @returns {Promise<void>}
+ */
+Engine.prototype.ping = async function(clientId) {
+  await this._ensureInitialized();
+
+  var timeout = this._server.timeout;
+  if (typeof timeout !== 'number') return;
+
+  var time = new Date().getTime();
+
+  try {
+    this._server.debug('[faye-redis] Ping ' + clientId + ', ' + time);
+    await this._redis.zAdd(this._ns + '/clients', time, clientId);
+  } catch (error) {
+    this._server.error('[faye-redis] Failed to ping client ' + clientId + ':', error);
+    throw error;
+  }
+};
+
+/**
+ * Subscribes a client to a channel.
+ * @param {string} clientId - The client ID.
+ * @param {string} channel - The channel to subscribe to.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<void>}
+ */
+Engine.prototype.subscribe = async function(clientId, channel, callback, context) {
+  await this._ensureInitialized();
+
+  var self = this;
+
+  try {
+    var added = await this._redis.sAdd(this._ns + '/clients/' + clientId + '/channels', channel);
+    if (added === 1) {
+      self._server.trigger('subscribe', clientId, channel);
+    }
+
+    await this._redis.sAdd(this._ns + '/channels' + channel, clientId);
+    self._server.debug('[faye-redis] Subscribed client ' + clientId + ' to channel ' + channel);
+
+    if (callback) callback.call(context);
+  } catch (error) {
+    self._server.error('[faye-redis] Failed to subscribe client:', error);
+    // Don't call callback on error - let the thrown error propagate to Promise-based callers
+    throw error;
+  }
+};
+
+/**
+ * Unsubscribes a client from a channel.
+ * @param {string} clientId - The client ID.
+ * @param {string} channel - The channel to unsubscribe from.
+ * @param {Function} [callback] - DEPRECATED: Use the returned Promise instead.
+ * @param {Object} [context] - DEPRECATED: The context for the callback.
+ * @returns {Promise<void>}
+ */
+Engine.prototype.unsubscribe = async function(clientId, channel, callback, context) {
+  await this._ensureInitialized();
+
+  var self = this;
+
+  try {
+    var removed = await this._redis.sRem(this._ns + '/clients/' + clientId + '/channels', channel);
+    if (removed === 1) {
+      self._server.trigger('unsubscribe', clientId, channel);
+    }
+
+    await this._redis.sRem(this._ns + '/channels' + channel, clientId);
+    self._server.debug('[faye-redis] Unsubscribed client ' + clientId + ' from channel ' + channel);
+
+    if (callback) callback.call(context);
+  } catch (error) {
+    self._server.error('[faye-redis] Failed to unsubscribe client:', error);
+    // Don't call callback on error - let the thrown error propagate to Promise-based callers
+    throw error;
+  }
+};
+
+/**
+ * Publishes a message to all subscribed clients on the given channels.
+ * @param {Object} message - The message to publish.
+ * @param {string[]} channels - The channels to publish to.
+ * @returns {Promise<void>}
+ */
+Engine.prototype.publish = async function(message, channels) {
+  await this._ensureInitialized();
+
+  var self        = this,
+      notified    = new Set(),
+      jsonMessage = JSON.stringify(message),
+      keys        = channels.map(function(c) { return self._ns + '/channels' + c; });
+
+  self._server.debug("[faye-redis] Publishing message to channels:", message, channels);
+  var notifyClient = async function(clientId) {
+    if (notified.has(clientId)) {
+      return;
+    }
+    notified.add(clientId);
+
+    var exists = await self.clientExists(clientId);
+
+    if (exists) {
+      self._server.debug('[faye-redis] Queueing for client ' + clientId + ':', JSON.stringify(message));
+      var messagesKey = self._ns + '/clients/' + clientId + '/messages';
+      // Execute independent Redis operations in parallel for better performance
+      await Promise.all([
+        self._redis.rPush(messagesKey, jsonMessage),
+        self._redis.publish(self._ns + '/notifications', clientId),
+        self._redis.expire(messagesKey, 3600)
+      ]);
+    } else {
+      self._server.debug("[faye-redis] Destroying expired client " + clientId + " from publish");
+      await self.destroyClient(clientId);
+    }
+  };
+
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    if (key.indexOf("*") === -1) {
+      try {
+        var clients = await self._redis.sMembers(key);
+        // Bound client work so large channels cannot overwhelm Redis or the process.
+        await runWithConcurrency(clients, self._publishConcurrency, notifyClient);
+      } catch (error) {
+        self._server.error("[faye-redis] Failed to fetch clients for channels " + keys.join(', ') + ": " + error.message);
+      }
+    }
+  }
+
+  this._server.trigger('publish', message.clientId, message.channel, message.data);
+};
+
+/**
+ * Delivers queued messages to a connected client.
+ * @param {string} clientId - The client ID to deliver messages to.
+ * @returns {Promise<void>}
+ */
+Engine.prototype.emptyQueue = async function(clientId) {
+  await this._ensureInitialized();
+
+  if (!this._server.hasConnection(clientId)) return;
+
+  var key = this._ns + '/clients/' + clientId + '/messages',
+      self = this;
+
+  try {
+    var conn = this._redis.connectionFor(key);
+    var multi = conn.multi();
+    multi.lRange(key, 0, -1);
+    multi.del(key);
+
+    var results = await multi.exec();
+    var jsonMessages = results[0] || [];
+    var messages = jsonMessages.map(function(json) { return JSON.parse(json); });
+    self._server.deliver(clientId, messages);
+  } catch (error) {
+    self._server.error('[faye-redis] Failed to empty queue:', error);
+  }
+};
+
+Engine.prototype.gc = function() {
+  var timeout = this._server.timeout;
+  if (typeof timeout !== 'number') return;
+
+  var self = this;
+
+  this._redis.urls.forEach(function(url) {
+    self._server.debug("[faye-redis] Starting GC loop for " + url);
+    process.nextTick(function() {
+      self._runGC(url, timeout).catch(function(err) {
+        self._server.error('[faye-redis] GC error:', err);
+      });
+    });
+
+    // Track the number of clients in each shard with a statsd gauge.
+    if (self.statsd) {
+      try {
+        var host = new URL(url).hostname.replace(/\./g, '_'),
+            conn = self._redis.connections[url],
+            key = "faye_redis.clients",
+            tag = "backend:" + host;
+
+        var intervalId = setInterval(async function() {
+          try {
+            var n = await conn.zCard(self._ns + "/clients");
+            self.statsd.gauge(key, n, 1, [tag]);
+          } catch (error) {
+            // Ignore errors
+          }
+        }, 10000);
+        self._gcIntervals.push(intervalId);
+      } catch (e) {
+        self._server.error('[faye-redis] Failed to parse URL for stats: ' + e.message);
+      }
+    }
+  });
+};
+
+Engine.prototype._runGC = async function(url, timeout) {
+  var conn = this._redis.connections[url],
+      cutoff = new Date().getTime() - 1000 * 2 * timeout,
+      self = this;
+
+  self._server.debug("[faye-redis] [" + url + "] _runGC called, cutoff: " + cutoff);
+
+  try {
+    var clients = await conn.zRangeByScore(this._ns + "/clients", 0, cutoff, { LIMIT: { offset: 0, count: 1 } });
+
+    self._server.debug("[faye-redis] [" + url + "] Found " + clients.length + " expired clients");
+
+    if (clients.length === 0) {
+      self._server.debug("[faye-redis] [" + url + "] No GC clients, retrying in 2 seconds...");
+      return setTimeout(self._runGC.bind(self), 2000, url, timeout);
+    }
+
+    var clientId = clients[0];
+    self._server.debug("[faye-redis] [" + url + "] Attempting to destroy client: " + clientId);
+
+    var success = await self.destroyClient(clientId);
+
+    if (success) {
+      self._server.debug("[faye-redis] [" + url + "] GC succeeded for " + clientId);
+    } else {
+      self._server.error("[faye-redis] [" + url + "] GC failed for " + clientId);
+    }
+
+    process.nextTick(function() {
+      self._runGC(url, timeout).catch(err => self._server.error('[faye-redis] GC error:', err));
+    });
+  } catch (error) {
+    self._server.error("[faye-redis] [" + url + "] Failed to fetch GC client: " + error.message + ", retrying in 2 seconds...");
+    return setTimeout(self._runGC.bind(self), 2000, url, timeout);
+  }
+};
+
+// A helper function to log a GC error and invoke the callback (if it exists).
+Engine.prototype._failGC = function(callback, context, msg) {
+  // Prepend [faye-redis] to the message
+  var args = Array.prototype.slice.call(arguments, 2, arguments.length);
+  if (args.length > 0 && typeof args[0] === 'string') {
+    args[0] = '[faye-redis] ' + args[0];
+  }
+  this._server.error.apply(this._server, args);
+  if (this.statsd) {
+    this.statsd.increment("faye_redis.gc_failure");
+  }
+  if (callback) {
+    callback.call(context, false);
+  }
+  return false;
 };
 
 module.exports = Engine;
