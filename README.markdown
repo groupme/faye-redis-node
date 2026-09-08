@@ -5,6 +5,10 @@ messaging server. It allows a single Faye service to be distributed across many
 front-end web servers by storing state and routing messages through a
 [Redis](http://redis.io) database server.
 
+Version 1.0.0 requires Node.js 18 or newer and uses the Promise-based Redis 4 API.
+This is a breaking upgrade from the 0.x releases; deprecated completion callbacks
+remain available while callers migrate to returned Promises.
+
 
 ## Usage
 
@@ -39,6 +43,7 @@ The full list of settings is as follows.
 * <b><tt>database</tt></b> - number of database to use, default is `0`
 * <b><tt>namespace</tt></b> - prefix applied to all keys, default is `''`
 * <b><tt>socket</tt></b> - path to Unix socket if `unixsocket` is set
+* <b><tt>publish_concurrency</tt></b> - maximum clients processed concurrently per published channel, default is `50`
 
 
 ## Development

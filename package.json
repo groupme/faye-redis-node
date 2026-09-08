@@ -4,7 +4,7 @@
   "homepage": "http://github.com/faye/faye-redis-node",
   "author": "James Coglan <jcoglan@gmail.com> (http://jcoglan.com/)",
   "keywords": ["pubsub", "bayeux"],
-  "version": "0.2.0",
+  "version": "1.0.0",
   "engines": {
     "node": ">=18.0.0"
   },
@@ -19,9 +19,10 @@
     "jsclass": "^4.0.0"
   },
   "scripts": {
-    "test": "node spec/simple_test.js",
+    "test": "node spec/review_regression_test.js && node spec/simple_test.js",
+    "test:review": "node spec/review_regression_test.js",
     "test:integration": "node spec/faye_integration_test.js",
-    "test:all": "node spec/simple_test.js && node spec/faye_integration_test.js",
+    "test:all": "npm test && node spec/faye_integration_test.js",
     "test:legacy": "node spec/runner.js"
   },
   "bugs": "http://github.com/faye/faye-redis-node/issues",

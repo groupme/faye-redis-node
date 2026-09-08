@@ -11,6 +11,7 @@ var multiRedis = function(urls) {
   self.urls          = urls;
   self.connections   = {};
   self.subscriptions = {};
+  self.topicSubscriptions = Object.create(null);
   self._ready        = false;
   self._readyPromise = null;
 };
@@ -24,21 +25,22 @@ multiRedis.prototype = {
       return self._readyPromise;
     }
 
-    self._readyPromise = (async function() {
-      for (var i = 0; i < self.urls.length; i++) {
-        var url = self.urls[i];
-        var options = self.parse(url);
-
-        var connection = await self.connect(options);
-        var subscription = await self.connectSubscriber(options);
-
-        self.connections[url] = connection;
-        self.subscriptions[url] = subscription;
-      }
-      self._ready = true;
-    })();
-
+    self._readyPromise = self._performInitialization();
     return self._readyPromise;
+  },
+
+  _performInitialization: async function() {
+    for (var i = 0; i < this.urls.length; i++) {
+      var url = this.urls[i];
+      var options = this.parse(url);
+
+      var connection = await this.connect(options);
+      var subscription = await this.connectSubscriber(options);
+
+      this.connections[url] = connection;
+      this.subscriptions[url] = subscription;
+    }
+    this._ready = true;
   },
 
   // Grab the connection from the ring for the pub/sub server for the message
@@ -55,17 +57,24 @@ multiRedis.prototype = {
   // Messages are sharded by key, so each message only exists on one server.
   // This ensures we receive notifications regardless of which shard published them.
   //
-  // IMPORTANT: This method should only be called once per topic. Calling it multiple
-  // times will register multiple handlers and cause duplicate message processing.
+  // Repeated calls for the same topic share the original subscription Promise and
+  // handler, preventing duplicate message processing.
   //
   // The callback signature is (channel, message) to match the original Faye API.
   // Redis v4+ provides (message, channel), so we swap the arguments.
-  subscribe: async function(topic, callback) {
-    var self = this;
+  subscribe: function(topic, callback) {
+    if (this.topicSubscriptions[topic]) {
+      return this.topicSubscriptions[topic];
+    }
 
-    for (var i = 0; i < self.urls.length; i++) {
-      var url = self.urls[i];
-      var subscription = self.subscriptions[url];
+    this.topicSubscriptions[topic] = this._performSubscription(topic, callback);
+    return this.topicSubscriptions[topic];
+  },
+
+  _performSubscription: async function(topic, callback) {
+    for (var i = 0; i < this.urls.length; i++) {
+      var url = this.urls[i];
+      var subscription = this.subscriptions[url];
 
       // Redis v4+ callback is (message, channel), but Faye expects (channel, message)
       await subscription.subscribe(topic, function(message, channel) {
@@ -170,6 +179,7 @@ multiRedis.prototype = {
         // Connection may already be closed
       }
     }
+    self.topicSubscriptions = Object.create(null);
   },
 
   // Returns a connection for a given key.
@@ -236,6 +246,41 @@ multiRedis.prototype = {
   }
 };
 
+var runWorker = async function(state) {
+  while (state.nextIndex < state.items.length) {
+    var index = state.nextIndex;
+    state.nextIndex += 1;
+    await state.iteratee(state.items[index]);
+  }
+};
+
+var runWithConcurrency = async function(items, concurrency, iteratee) {
+  var workerCount = Math.min(items.length, concurrency);
+  var state = {
+    items: items,
+    iteratee: iteratee,
+    nextIndex: 0
+  };
+  var workers = [];
+
+  for (var i = 0; i < workerCount; i++) {
+    workers.push(runWorker(state));
+  }
+
+  await Promise.all(workers);
+};
+
+var normalizeRedisScore = function(score) {
+  if (typeof score === 'number') {
+    return Number.isFinite(score) ? score : null;
+  }
+  if (typeof score === 'string' && score.trim() !== '') {
+    var parsed = Number(score);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
+
 // Creates a new Faye Redis engine.
 //
 // Options:
@@ -246,6 +291,9 @@ multiRedis.prototype = {
 //                         Seeing as how it's no longer interval-based, you
 //                         probably only want to set this in a dedicated GC
 //                         process.
+//
+//   publish_concurrency   Maximum number of clients processed concurrently for
+//                         each published channel. Defaults to 50.
 //
 var Engine = function(server, options) {
   this._options = options || {};
@@ -258,6 +306,7 @@ var Engine = function(server, options) {
   this._initialized = false;
   this._initPromise = null;
   this._gcIntervals = [];
+  this._publishConcurrency = this._normalizePublishConcurrency(this._options.publish_concurrency);
 
   // Auto-initialize on construction (for Faye compatibility)
   // This starts the async connection process immediately
@@ -271,47 +320,47 @@ Engine.create = function(server, options) {
 // Ensures the engine is initialized, starting initialization if needed.
 // Returns a promise that resolves when initialization is complete.
 Engine.prototype._ensureInitialized = function() {
-  var self = this;
-
   if (this._initPromise) {
     return this._initPromise;
   }
 
-  this._initPromise = (async function() {
-    try {
-      await self._redis.init();
-
-      if (!self._options.disable_subscriptions) {
-        await self._redis.subscribe(self._ns + '/notifications', function(topic, message) {
-          self.emptyQueue(message).catch(err => self._server.error('[faye-redis] Failed to empty queue on notification:', err));
-        });
-      }
-
-      if (self._options.gc) {
-        if (process.env.STATSD_URL) {
-          try {
-            var statsd = require("node-statsd").StatsD;
-
-            var statsdUrl = new URL(process.env.STATSD_URL);
-            var prefix = "push." + process.env.NODE_ENV + ".";
-            self.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
-          } catch (e) {
-            self._server.error('[faye-redis] Invalid STATSD_URL, disabling StatsD: ' + e.message);
-          }
-        }
-
-        self.gc();
-      }
-
-      self._initialized = true;
-      self._server.debug('[faye-redis] Redis engine initialized successfully');
-    } catch (error) {
-      self._server.error('[faye-redis] Failed to initialize Redis engine:', error);
-      throw error;
-    }
-  })();
-
+  this._initPromise = this._performInitialization();
   return this._initPromise;
+};
+
+Engine.prototype._performInitialization = async function() {
+  try {
+    await this._redis.init();
+
+    if (!this._options.disable_subscriptions) {
+      var self = this;
+      await this._redis.subscribe(this._ns + '/notifications', function(topic, message) {
+        self.emptyQueue(message).catch(err => self._server.error('[faye-redis] Failed to empty queue on notification:', err));
+      });
+    }
+
+    if (this._options.gc) {
+      if (process.env.STATSD_URL) {
+        try {
+          var statsd = require("node-statsd").StatsD;
+
+          var statsdUrl = new URL(process.env.STATSD_URL);
+          var prefix = "push." + process.env.NODE_ENV + ".";
+          this.statsd = new statsd(statsdUrl.hostname, statsdUrl.port, prefix);
+        } catch (e) {
+          this._server.error('[faye-redis] Invalid STATSD_URL, disabling StatsD: ' + e.message);
+        }
+      }
+
+      this.gc();
+    }
+
+    this._initialized = true;
+    this._server.debug('[faye-redis] Redis engine initialized successfully');
+  } catch (error) {
+    this._server.error('[faye-redis] Failed to initialize Redis engine:', error);
+    throw error;
+  }
 };
 
 // Public init method for explicit initialization (also used by tests)
@@ -321,6 +370,14 @@ Engine.prototype.init = function() {
 
 Engine.prototype.DEFAULT_GC = 60;
 Engine.prototype.LOCK_TIMEOUT = 120;
+Engine.prototype.DEFAULT_PUBLISH_CONCURRENCY = 50;
+
+Engine.prototype._normalizePublishConcurrency = function(value) {
+  var parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0
+    ? parsed
+    : this.DEFAULT_PUBLISH_CONCURRENCY;
+};
 
 Engine.prototype.disconnect = async function() {
   await this._redis.end();
@@ -394,7 +451,8 @@ Engine.prototype.clientExists = async function(clientId, callback, context) {
   }
 
   try {
-    var score = await this._redis.zScore(this._ns + '/clients', clientId);
+    var redisScore = await this._redis.zScore(this._ns + '/clients', clientId);
+    var score = normalizeRedisScore(redisScore);
     var exists;
     if (timeout) {
       exists = score !== null && score > new Date().getTime() - 1000 * 1.75 * timeout;
@@ -605,8 +663,8 @@ Engine.prototype.publish = async function(message, channels) {
     if (key.indexOf("*") === -1) {
       try {
         var clients = await self._redis.sMembers(key);
-        // Process clients in parallel for better performance
-        await Promise.all(clients.map(notifyClient));
+        // Bound client work so large channels cannot overwhelm Redis or the process.
+        await runWithConcurrency(clients, self._publishConcurrency, notifyClient);
       } catch (error) {
         self._server.error("[faye-redis] Failed to fetch clients for channels " + keys.join(', ') + ": " + error.message);
       }

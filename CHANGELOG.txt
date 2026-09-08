@@ -1,3 +1,11 @@
+=== 1.0.0 / 2026-09-08
+
+* BREAKING: Require Node.js 18 or newer.
+* BREAKING: Upgrade to the Promise-based Redis 4 API and remove hiredis.
+* Preserve deprecated callback support while making engine operations awaitable.
+* Bound per-channel publish concurrency and make topic subscriptions idempotent.
+
+
 === 0.1.1 / 2012-07-15
 
 * Fix an implicit global variable leak (missing semicolon)
@@ -6,4 +14,3 @@
 === 0.1.0 / 2012-02-26
 
 * Initial release: Redis backend for Faye 0.8
-
